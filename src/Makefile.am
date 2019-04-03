@@ -2839,7 +2839,7 @@ endif
 # slave->agent rename is complete (MESOS-3782 & MESOS-5230).
 copy-template-and-create-symlink:
 	cd $(DESTDIR)/$(pkgsysconfdir) && \
-	  $(LN_S) mesos-agent-env.sh.template mesos-slave-env.sh.template
+	  $(LN_S) -f mesos-agent-env.sh.template mesos-slave-env.sh.template
 	cd $(DESTDIR)/$(includedir)/mesos && $(LN_S) agent slave
 
 PHONY_TARGETS += copy-template-and-create-symlink
@@ -2860,7 +2860,7 @@ install-data-hook: copy-template-and-create-symlink
 	done
 
 install-exec-hook:
-	cd $(DESTDIR)/$(sbindir) && $(LN_S) mesos-agent mesos-slave
+	cd $(DESTDIR)/$(sbindir) && $(LN_S) -f mesos-agent mesos-slave
 
 # TODO(tomxing): Remove this hook once the
 # slave->agent rename is complete(MESOS-3782 & MESOS 5230).
