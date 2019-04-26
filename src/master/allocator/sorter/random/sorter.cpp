@@ -33,6 +33,7 @@
 #include <stout/option.hpp>
 #include <stout/strings.hpp>
 
+using std::pair;
 using std::set;
 using std::string;
 using std::vector;
@@ -46,13 +47,13 @@ namespace allocator {
 
 
 RandomSorter::RandomSorter()
-  : root(new Node("", Node::INTERNAL, nullptr)) {}
+  : sortInfo(this), root(new Node("", Node::INTERNAL, nullptr)) {}
 
 
 RandomSorter::RandomSorter(
     const UPID& allocator,
     const string& metricsPrefix)
-  : root(new Node("", Node::INTERNAL, nullptr)) {}
+  : sortInfo(this), root(new Node("", Node::INTERNAL, nullptr)) {}
 
 
 RandomSorter::~RandomSorter()
@@ -67,102 +68,93 @@ void RandomSorter::initialize(
 
 void RandomSorter::add(const string& clientPath)
 {
-  vector<string> pathElements = strings::tokenize(clientPath, "/");
-  CHECK(!pathElements.empty());
+  CHECK(!clients.contains(clientPath)) << clientPath;
 
-  Node* current = root;
-  Node* lastCreatedNode = nullptr;
+  sortInfo.dirty = true;
+
+  // Adding a client is a two phase algorithm:
+  //
+  //            root
+  //          /  |  \       Three interesting cases:
+  //         a   e   w        Add a                     (i.e. phase 1(a))
+  //         |      / \       Add e/f, e/f/g, e/f/g/... (i.e. phase 1(b))
+  //         b     .   z      Add w/x, w/x/y, w/x/y/... (i.e. phase 1(c))
+  //
+  //   Phase 1: Walk down the tree until:
+  //     (a) we run out of tokens -> add "." node
+  //     (b) or, we reach a leaf -> transform the leaf into internal + "."
+  //     (c) or, we're at an internal node but can't find the next child
+  //
+  //   Phase 2: For any remaining tokens, walk down creating children:
+  //     (a) if last token of the client path -> create INACTIVE_LEAF
+  //     (b) else, create INTERNAL and keep going
+
+  vector<string> tokens = strings::split(clientPath, "/");
+  auto token = tokens.begin();
 
   // Traverse the tree to add new nodes for each element of the path,
   // if that node doesn't already exist (similar to `mkdir -p`).
-  foreach (const string& element, pathElements) {
-    Node* node = nullptr;
+  Node* current = root;
 
-    foreach (Node* child, current->children) {
-      if (child->name == element) {
-        node = child;
-        break;
-      }
+  // Phase 1:
+  while (true) {
+    // Case (a).
+    if (token == tokens.end()) {
+      Node* virt = new Node(".", Node::INACTIVE_LEAF, current);
+
+      current->addChild(virt);
+      current = virt;
+
+      break;
     }
 
-    if (node != nullptr) {
-      current = node;
-      continue;
-    }
-
-    // We didn't find `element`, so add a new child to `current`.
-    //
-    // If adding this child would result in turning `current` from a
-    // leaf node into an internal node, we need to create an
-    // additional child node: `current` must have been associated with
-    // a client and clients must always be associated with leaf nodes.
+    // Case (b).
     if (current->isLeaf()) {
-      Node* parent = CHECK_NOTNULL(current->parent);
+      Node::Kind oldKind = current->kind;
 
-      parent->removeChild(current);
+      current->parent->removeChild(current);
+      current->kind = Node::INTERNAL;
+      current->parent->addChild(current);
 
-      // Create a node under `parent`. This internal node will take
-      // the place of `current` in the tree.
-      Node* internal = new Node(current->name, Node::INTERNAL, parent);
-      parent->addChild(internal);
-      internal->allocation = current->allocation;
+      Node* virt = new Node(".", oldKind, current);
+      virt->allocation = current->allocation;
 
-      CHECK_EQ(current->path, internal->path);
+      current->addChild(virt);
+      clients[virt->clientPath()] = virt;
 
-      // Update `current` to become a virtual leaf node and a child of
-      // `internal`.
-      current->name = ".";
-      current->parent = internal;
-      current->path = strings::join("/", parent->path, current->name);
-
-      internal->addChild(current);
-
-      CHECK_EQ(internal->path, current->clientPath());
-
-      current = internal;
+      break;
     }
 
-    // Now actually add a new child to `current`.
-    Node* newChild = new Node(element, Node::INTERNAL, current);
-    current->addChild(newChild);
+    Option<Node*> child = [&]() -> Option<Node*> {
+      foreach (Node* c, current->children) {
+        if (c->name == *token) return c;
+      }
+      return None();
+    }();
 
-    current = newChild;
-    lastCreatedNode = newChild;
+    // Case (c).
+    if (child.isNone()) break;
+
+    current = *child;
+    ++token;
   }
 
-  CHECK(current->kind == Node::INTERNAL);
+  // Phase 2:
+  for (; token != tokens.end(); ++token) {
+    Node::Kind kind = (token == tokens.end() - 1)
+      ? Node::INACTIVE_LEAF : Node::INTERNAL;
 
-  // `current` is the node associated with the last element of the
-  // path. If we didn't add `current` to the tree above, create a leaf
-  // node now. For example, if the tree contains "a/b" and we add a
-  // new client "a", we want to create a new leaf node "a/." here.
-  if (current != lastCreatedNode) {
-    Node* newChild = new Node(".", Node::INACTIVE_LEAF, current);
-    current->addChild(newChild);
-    current = newChild;
-  } else {
-    // If we created `current` in the loop above, it was marked an
-    // `INTERNAL` node. It should actually be an inactive leaf node.
-    current->kind = Node::INACTIVE_LEAF;
+    Node* child = new Node(*token, kind, current);
 
-    // `current` has changed from an internal node to an inactive
-    // leaf, so remove and re-add it to its parent. This moves it to
-    // the end of the parent's list of children.
-    CHECK_NOTNULL(current->parent);
-
-    current->parent->removeChild(current);
-    current->parent->addChild(current);
+    current->addChild(child);
+    current = child;
   }
 
-  // `current` is the newly created node associated with the last
-  // element of the path. `current` should be an inactive leaf node.
   CHECK(current->children.empty());
   CHECK(current->kind == Node::INACTIVE_LEAF);
 
-  // Add a new entry to the lookup table. The full path of the newly
-  // added client should not already exist in `clients`.
   CHECK_EQ(clientPath, current->clientPath());
-  CHECK(!clients.contains(clientPath));
+  CHECK(!clients.contains(clientPath)) << clientPath;
 
   clients[clientPath] = current;
 }
@@ -170,6 +162,8 @@ void RandomSorter::add(const string& clientPath)
 
 void RandomSorter::remove(const string& clientPath)
 {
+  sortInfo.dirty = true;
+
   Node* current = CHECK_NOTNULL(find(clientPath));
 
   // Save a copy of the leaf node's allocated resources, because we
@@ -199,14 +193,11 @@ void RandomSorter::remove(const string& clientPath)
 
     // Update `parent` to reflect the fact that the resources in the
     // leaf node are no longer allocated to the subtree rooted at
-    // `parent`. We skip `root`, because we never update the
-    // allocation made to the root node.
-    if (parent != root) {
-      foreachpair (const SlaveID& slaveId,
-                   const Resources& resources,
-                   leafAllocation) {
-        parent->allocation.subtract(slaveId, resources);
-      }
+    // `parent`.
+    foreachpair (const SlaveID& slaveId,
+                 const Resources& resources,
+                 leafAllocation) {
+      parent->allocation.subtract(slaveId, resources);
     }
 
     if (current->children.empty()) {
@@ -250,6 +241,8 @@ void RandomSorter::remove(const string& clientPath)
 
 void RandomSorter::activate(const string& clientPath)
 {
+  sortInfo.dirty = true;
+
   Node* client = CHECK_NOTNULL(find(clientPath));
 
   if (client->kind == Node::INACTIVE_LEAF) {
@@ -267,6 +260,8 @@ void RandomSorter::activate(const string& clientPath)
 
 void RandomSorter::deactivate(const string& clientPath)
 {
+  sortInfo.dirty = true;
+
   Node* client = CHECK_NOTNULL(find(clientPath));
 
   if (client->kind == Node::ACTIVE_LEAF) {
@@ -284,6 +279,8 @@ void RandomSorter::deactivate(const string& clientPath)
 
 void RandomSorter::updateWeight(const string& path, double weight)
 {
+  sortInfo.dirty = true;
+
   weights[path] = weight;
 
   // Update the weight of the corresponding internal node,
@@ -313,12 +310,9 @@ void RandomSorter::allocated(
 {
   Node* current = CHECK_NOTNULL(find(clientPath));
 
-  // NOTE: We don't currently update the `allocation` for the root
-  // node. This is debatable, but the current implementation doesn't
-  // require looking at the allocation of the root node.
-  while (current != root) {
+  while (current != nullptr) {
     current->allocation.add(slaveId, resources);
-    current = CHECK_NOTNULL(current->parent);
+    current = current->parent;
   }
 }
 
@@ -334,12 +328,9 @@ void RandomSorter::update(
 
   Node* current = CHECK_NOTNULL(find(clientPath));
 
-  // NOTE: We don't currently update the `allocation` for the root
-  // node. This is debatable, but the current implementation doesn't
-  // require looking at the allocation of the root node.
-  while (current != root) {
+  while (current != nullptr) {
     current->allocation.update(slaveId, oldAllocation, newAllocation);
-    current = CHECK_NOTNULL(current->parent);
+    current = current->parent;
   }
 }
 
@@ -351,12 +342,9 @@ void RandomSorter::unallocated(
 {
   Node* current = CHECK_NOTNULL(find(clientPath));
 
-  // NOTE: We don't currently update the `allocation` for the root
-  // node. This is debatable, but the current implementation doesn't
-  // require looking at the allocation of the root node.
-  while (current != root) {
+  while (current != nullptr) {
     current->allocation.subtract(slaveId, resources);
-    current = CHECK_NOTNULL(current->parent);
+    current = current->parent;
   }
 }
 
@@ -374,6 +362,12 @@ const ResourceQuantities& RandomSorter::allocationScalarQuantities(
 {
   const Node* client = CHECK_NOTNULL(find(clientPath));
   return client->allocation.totals;
+}
+
+
+const ResourceQuantities& RandomSorter::allocationScalarQuantities() const
+{
+  return root->allocation.totals;
 }
 
 
@@ -477,66 +471,16 @@ void RandomSorter::remove(const SlaveID& slaveId, const Resources& resources)
 
 vector<string> RandomSorter::sort()
 {
-  std::function<void (Node*)> shuffleTree = [this, &shuffleTree](Node* node) {
-    // Inactive leaves are always stored at the end of the
-    // `children` vector; this means that we should only shuffle
-    // the prefix of the vector before the first inactive leaf.
-    auto inactiveBegin = std::find_if(
-        node->children.begin(),
-        node->children.end(),
-        [](Node* n) { return n->kind == Node::INACTIVE_LEAF; });
+  pair<vector<string>, vector<double>> clientsAndWeights =
+    SortInfo(this).getClientsAndWeights();
 
-    vector<double> weights(inactiveBegin - node->children.begin());
+  weightedShuffle(
+      clientsAndWeights.first.begin(),
+      clientsAndWeights.first.end(),
+      clientsAndWeights.second,
+      generator);
 
-    for (int i = 0; i < inactiveBegin - node->children.begin(); ++i) {
-      weights[i] = getWeight(node->children[i]);
-    }
-
-    weightedShuffle(node->children.begin(), inactiveBegin, weights, generator);
-
-    foreach (Node* child, node->children) {
-      if (child->kind == Node::INTERNAL) {
-        shuffleTree(child);
-      } else if (child->kind == Node::INACTIVE_LEAF) {
-        break;
-      }
-    }
-  };
-
-  shuffleTree(root);
-
-  // Return all active leaves in the tree via pre-order traversal.
-  // The children of each node are already shuffled, with
-  // inactive leaves stored after active leaves and internal nodes.
-  vector<string> result;
-
-  // TODO(bmahler): This over-reserves where there are inactive
-  // clients, only reserve the number of active clients.
-  result.reserve(clients.size());
-
-  std::function<void (const Node*)> listClients =
-      [&listClients, &result](const Node* node) {
-    foreach (const Node* child, node->children) {
-      switch (child->kind) {
-        case Node::ACTIVE_LEAF:
-          result.push_back(child->clientPath());
-          break;
-
-        case Node::INACTIVE_LEAF:
-          // As soon as we see the first inactive leaf, we can stop
-          // iterating over the current node's list of children.
-          return;
-
-        case Node::INTERNAL:
-          listClients(child);
-          break;
-      }
-    }
-  };
-
-  listClients(root);
-
-  return result;
+  return std::move(clientsAndWeights.first);
 }
 
 
@@ -562,6 +506,45 @@ double RandomSorter::getWeight(const Node* node) const
 }
 
 
+hashset<RandomSorter::Node*> RandomSorter::activeInternalNodes() const
+{
+  // Using post-order traversal to find all the internal nodes
+  // that have at least one active leaf descendant and store
+  // them in the input `result` hashset.
+  //
+  // Returns true if the subtree at the input `node` contains any
+  // active leaf node.
+  std::function<bool(Node*, hashset<Node*>&)> searchActiveInternal =
+    [&searchActiveInternal](Node* node, hashset<Node*>& result) {
+      switch (node->kind) {
+        case Node::ACTIVE_LEAF: return true;
+
+        case Node::INACTIVE_LEAF: return false;
+
+        case Node::INTERNAL: {
+          bool active = false;
+          foreach (Node* child, node->children) {
+            if (searchActiveInternal(child, result)) {
+              active = true;
+            }
+          }
+
+          if (active) {
+            result.insert(node);
+          }
+          return active;
+        }
+      }
+      UNREACHABLE();
+    };
+
+  hashset<Node*> result;
+  searchActiveInternal(root, result);
+
+  return result;
+}
+
+
 RandomSorter::Node* RandomSorter::find(const string& clientPath) const
 {
   Option<Node*> client_ = clients.get(clientPath);
@@ -575,6 +558,78 @@ RandomSorter::Node* RandomSorter::find(const string& clientPath) const
   CHECK(client->isLeaf());
 
   return client;
+}
+
+
+pair<vector<string>, vector<double>>
+RandomSorter::SortInfo::getClientsAndWeights()
+{
+  updateRelativeWeights();
+
+  return std::make_pair(clients, weights);
+}
+
+
+void RandomSorter::SortInfo::updateRelativeWeights()
+{
+  if (!dirty) {
+    return;
+  }
+
+  hashset<Node*> activeInternalNodes = sorter->activeInternalNodes();
+
+  auto isActive = [&activeInternalNodes](Node* node) {
+    return node->kind == Node::ACTIVE_LEAF ||
+           activeInternalNodes.contains(node);
+  };
+
+  // Note, though we reserve here, the size of the vector will always
+  // grow (as we add more roles).
+  clients.reserve(sorter->clients.size());
+  weights.reserve(sorter->clients.size());
+
+  // We use the following formula to compute the relative weights (Rw):
+  //
+  //                                    weight(node)
+  // Rw(node) = Rw(parent) * -------------------------------------------
+  //                         weight(node) + SUM(weight(active siblings))
+  //
+  // Using pre-order traversal to calculate node's relative weight.
+  // Active leaves and their relative weights are stored in `clients`
+  // and `weights`.
+  std::function<void(Node*, double, double)> calculateRelativeWeights =
+    [&](Node* node, double siblingWeights, double parentRelativeWeight) {
+      // We only calculate relative weights for active nodes.
+      if (!isActive(node)) {
+        return;
+      }
+      double relativeWeight = parentRelativeWeight * sorter->getWeight(node) /
+                              (sorter->getWeight(node) + siblingWeights);
+
+      // Store the result for active leaves.
+      if (node->kind == Node::ACTIVE_LEAF) {
+        clients.push_back(node->clientPath());
+        weights.push_back(relativeWeight);
+      }
+
+      // Calculate active children's total weights.
+      double totalWeights_ = 0.0;
+
+      foreach (Node* child, node->children) {
+        totalWeights_ += isActive(child) ? sorter->getWeight(child) : 0.0;
+      }
+
+      foreach (Node* child, node->children) {
+        if (isActive(child)) {
+          calculateRelativeWeights(
+              child, totalWeights_ - sorter->getWeight(child), relativeWeight);
+        }
+      }
+    };
+
+  calculateRelativeWeights(sorter->root, 0.0, 1.0);
+
+  dirty = false;
 }
 
 } // namespace allocator {

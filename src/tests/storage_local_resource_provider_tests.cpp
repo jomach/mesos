@@ -22,6 +22,9 @@
 #include <tuple>
 #include <vector>
 
+#include <mesos/csi/v0.hpp>
+#include <mesos/csi/v1.hpp>
+
 #include <process/clock.hpp>
 #include <process/collect.hpp>
 #include <process/future.hpp>
@@ -41,16 +44,14 @@
 #include <stout/os/realpath.hpp>
 
 #include "csi/paths.hpp"
-#include "csi/rpc.hpp"
 #include "csi/state.hpp"
+#include "csi/v0_volume_manager_process.hpp"
 
 #include "linux/fs.hpp"
 
 #include "master/detector/standalone.hpp"
 
 #include "module/manager.hpp"
-
-#include "resource_provider/storage/provider_process.hpp"
 
 #include "slave/container_daemon_process.hpp"
 #include "slave/paths.hpp"
@@ -89,6 +90,8 @@ using process::reap;
 
 using process::grpc::StatusError;
 
+using testing::_;
+using testing::A;
 using testing::AllOf;
 using testing::AtMost;
 using testing::Between;
@@ -4129,48 +4132,17 @@ TEST_F(StorageLocalResourceProviderTest, CsiPluginRpcMetrics)
 
   ASSERT_SOME(source);
 
-  JSON::Object snapshot = Metrics();
+  // We expect that the following RPC calls are made during startup: `Probe`,
+  // `GetPluginInfo` (2), `GetPluginCapabilities, `ControllerGetCapabilities`,
+  // `ListVolumes`, `GetCapacity`, `NodeGetCapabilities`, `NodeGetId`.
+  //
+  // TODO(chhsiao): As these are implementation details, we should count the
+  // calls processed by a mock CSI plugin and check the metrics against that.
+  const int numFinishedStartupRpcs = 9;
 
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.Probe/successes")));
-  EXPECT_EQ(1, snapshot.values.at( metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.Probe/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginInfo/successes")));
-  EXPECT_EQ(2, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginInfo/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginCapabilities/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginCapabilities/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ControllerGetCapabilities/successes"))); // NOLINT(whitespace/line_length)
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ControllerGetCapabilities/successes"))); // NOLINT(whitespace/line_length)
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ListVolumes/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ListVolumes/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.GetCapacity/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.GetCapacity/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.CreateVolume/successes")));
-  EXPECT_EQ(0, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.CreateVolume/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.DeleteVolume/errors")));
-  EXPECT_EQ(0, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.DeleteVolume/errors")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetCapabilities/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetCapabilities/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetId/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetId/successes")));
+  EXPECT_TRUE(metricEquals(
+      metricName("csi_plugin/rpcs_finished"), numFinishedStartupRpcs));
+  EXPECT_TRUE(metricEquals(metricName("csi_plugin/rpcs_failed"), 0));
 
   // Create a volume.
   EXPECT_CALL(sched, resourceOffers(&driver, OffersHaveAnyResource(
@@ -4203,48 +4175,10 @@ TEST_F(StorageLocalResourceProviderTest, CsiPluginRpcMetrics)
   ASSERT_TRUE(volume->disk().source().mount().has_root());
   EXPECT_FALSE(path::absolute(volume->disk().source().mount().root()));
 
-  snapshot = Metrics();
-
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.Probe/successes")));
-  EXPECT_EQ(1, snapshot.values.at( metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.Probe/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginInfo/successes")));
-  EXPECT_EQ(2, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginInfo/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginCapabilities/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginCapabilities/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ControllerGetCapabilities/successes"))); // NOLINT(whitespace/line_length)
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ControllerGetCapabilities/successes"))); // NOLINT(whitespace/line_length)
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ListVolumes/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ListVolumes/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.GetCapacity/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.GetCapacity/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.CreateVolume/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.CreateVolume/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.DeleteVolume/errors")));
-  EXPECT_EQ(0, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.DeleteVolume/errors")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetCapabilities/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetCapabilities/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetId/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetId/successes")));
+  // An additional `CreateVolume` RPC call is now finished.
+  EXPECT_TRUE(metricEquals(
+      metricName("csi_plugin/rpcs_finished"), numFinishedStartupRpcs + 1));
+  EXPECT_TRUE(metricEquals(metricName("csi_plugin/rpcs_failed"), 0));
 
   // Remove the volume out of band to fail `DESTROY_DISK`.
   Option<string> volumePath;
@@ -4271,48 +4205,10 @@ TEST_F(StorageLocalResourceProviderTest, CsiPluginRpcMetrics)
   AWAIT_READY(operationFailedOffers);
   ASSERT_FALSE(operationFailedOffers->empty());
 
-  snapshot = Metrics();
-
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.Probe/successes")));
-  EXPECT_EQ(1, snapshot.values.at( metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.Probe/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginInfo/successes")));
-  EXPECT_EQ(2, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginInfo/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginCapabilities/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Identity.GetPluginCapabilities/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ControllerGetCapabilities/successes"))); // NOLINT(whitespace/line_length)
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ControllerGetCapabilities/successes"))); // NOLINT(whitespace/line_length)
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ListVolumes/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.ListVolumes/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.GetCapacity/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.GetCapacity/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.CreateVolume/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.CreateVolume/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.DeleteVolume/errors")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.DeleteVolume/errors")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetCapabilities/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetCapabilities/successes")));
-  ASSERT_NE(0u, snapshot.values.count(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetId/successes")));
-  EXPECT_EQ(1, snapshot.values.at(metricName(
-      "csi_plugin/rpcs/csi.v0.Node.NodeGetId/successes")));
+  // An additional `DeleteVolume` RPC call is now failed.
+  EXPECT_TRUE(metricEquals(
+      metricName("csi_plugin/rpcs_finished"), numFinishedStartupRpcs + 1));
+  EXPECT_TRUE(metricEquals(metricName("csi_plugin/rpcs_failed"), 1));
 }
 
 
@@ -4902,7 +4798,12 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
   MockCSIPlugin plugin;
   ASSERT_SOME(plugin.startup(mockCsiEndpoint));
 
-  EXPECT_CALL(plugin, GetCapacity(_, _, _))
+  // TODO(chhsiao): Since this test expects CSI v0 protobufs, we disable CSI v1
+  // for now. Remove this once the expectations are parameterized.
+  EXPECT_CALL(plugin, Probe(_, _, A<csi::v1::ProbeResponse*>()))
+    .WillRepeatedly(Return(grpc::Status(grpc::UNIMPLEMENTED, "")));
+
+  EXPECT_CALL(plugin, GetCapacity(_, _, A<csi::v0::GetCapacityResponse*>()))
     .WillRepeatedly(Invoke([](
         grpc::ServerContext* context,
         const csi::v0::GetCapacityRequest* request,
@@ -4914,7 +4815,7 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
 
   Queue<csi::v0::CreateVolumeRequest> createVolumeRequests;
   Queue<Try<csi::v0::CreateVolumeResponse, StatusError>> createVolumeResults;
-  EXPECT_CALL(plugin, CreateVolume(_, _, _))
+  EXPECT_CALL(plugin, CreateVolume(_, _, A<csi::v0::CreateVolumeResponse*>()))
     .WillRepeatedly(Invoke([&](
         grpc::ServerContext* context,
         const csi::v0::CreateVolumeRequest* request,
@@ -4939,7 +4840,7 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
 
   Queue<csi::v0::DeleteVolumeRequest> deleteVolumeRequests;
   Queue<Try<csi::v0::DeleteVolumeResponse, StatusError>> deleteVolumeResults;
-  EXPECT_CALL(plugin, DeleteVolume(_, _, _))
+  EXPECT_CALL(plugin, DeleteVolume(_, _, A<csi::v0::DeleteVolumeResponse*>()))
     .WillRepeatedly(Invoke([&](
         grpc::ServerContext* context,
         const csi::v0::DeleteVolumeRequest* request,
@@ -5038,6 +4939,18 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
     .filter(std::bind(isStoragePool<Resource>, lambda::_1, "test"))
     .begin();
 
+  // We expect that the following RPC calls are made during startup: `Probe`,
+  // `GetPluginInfo` (2), `GetPluginCapabilities, `ControllerGetCapabilities`,
+  // `ListVolumes`, `GetCapacity`, `NodeGetCapabilities`, `NodeGetId`.
+  //
+  // TODO(chhsiao): As these are implementation details, we should count the
+  // calls processed by a mock CSI plugin and check the metrics against that.
+  const int numFinishedStartupRpcs = 9;
+
+  EXPECT_TRUE(metricEquals(
+      metricName("csi_plugin/rpcs_finished"), numFinishedStartupRpcs));
+  EXPECT_TRUE(metricEquals(metricName("csi_plugin/rpcs_failed"), 0));
+
   // Create a MOUNT disk.
   Future<UpdateOperationStatusMessage> updateOperationStatus =
     FUTURE_PROTOBUF(UpdateOperationStatusMessage(), _, _);
@@ -5047,14 +4960,14 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
       {CREATE_DISK(raw, Resource::DiskInfo::Source::MOUNT)});
 
   AWAIT_READY(createVolumeRequests.get())
-    << "Failed to wait for " << csi::v0::CREATE_VOLUME << " call #1";
+    << "Failed to wait for CreateVolumeRequest #1";
 
   // Settle the clock to verify that there is no more outstanding request.
   Clock::settle();
   ASSERT_EQ(0u, createVolumeRequests.size());
 
   Future<Nothing> createVolumeCall = FUTURE_DISPATCH(
-      _, &StorageLocalResourceProviderProcess::__call<csi::v0::CREATE_VOLUME>);
+      _, &csi::v0::VolumeManagerProcess::__call<csi::v0::CreateVolumeResponse>);
 
   // Return `DEADLINE_EXCEEDED` for the first `CreateVolume` call.
   createVolumeResults.put(
@@ -5062,7 +4975,7 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
 
   AWAIT_READY(createVolumeCall);
 
-  Duration createVolumeBackoff = DEFAULT_CSI_RETRY_BACKOFF_FACTOR;
+  Duration createVolumeBackoff = csi::v0::DEFAULT_CSI_RETRY_BACKOFF_FACTOR;
 
   // Settle the clock to ensure that the retry timer has been set, then advance
   // the clock by the maximum backoff to trigger a retry.
@@ -5072,8 +4985,7 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
   // Return `UNAVAILABLE` for subsequent `CreateVolume` calls.
   for (size_t i = 1; i < numRetryableErrors; i++) {
     AWAIT_READY(createVolumeRequests.get())
-      << "Failed to wait for " << csi::v0::CREATE_VOLUME << " call #"
-      << (i + 1);
+      << "Failed to wait for CreateVolumeRequest #" << (i + 1);
 
     // Settle the clock to verify that there is no more outstanding request.
     Clock::settle();
@@ -5081,14 +4993,14 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
 
     createVolumeCall = FUTURE_DISPATCH(
         _,
-        &StorageLocalResourceProviderProcess::__call<csi::v0::CREATE_VOLUME>);
+        &csi::v0::VolumeManagerProcess::__call<csi::v0::CreateVolumeResponse>);
 
     createVolumeResults.put(StatusError(grpc::Status(grpc::UNAVAILABLE, "")));
 
     AWAIT_READY(createVolumeCall);
 
-    createVolumeBackoff =
-      std::min(createVolumeBackoff * 2, DEFAULT_CSI_RETRY_INTERVAL_MAX);
+    createVolumeBackoff = std::min(
+        createVolumeBackoff * 2, csi::v0::DEFAULT_CSI_RETRY_INTERVAL_MAX);
 
     // Settle the clock to ensure that the retry timer has been set, then
     // advance the clock by the maximum backoff to trigger a retry.
@@ -5097,8 +5009,7 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
   }
 
   AWAIT_READY(createVolumeRequests.get())
-    << "Failed to wait for " << csi::v0::CREATE_VOLUME << " call #"
-    << (numRetryableErrors + 1);
+    << "Failed to wait for CreateVolumeRequest #" << (numRetryableErrors + 1);
 
   // Settle the clock to verify that there is no more outstanding request.
   Clock::settle();
@@ -5135,14 +5046,14 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
   driver.acceptOffers({offers->at(0).id()}, {DESTROY_DISK(created)});
 
   AWAIT_READY(deleteVolumeRequests.get())
-    << "Failed to wait for " << csi::v0::DELETE_VOLUME << " call #1";
+    << "Failed to wait for DeleteVolumeRequest #1";
 
   // Settle the clock to verify that there is no more outstanding request.
   Clock::settle();
   ASSERT_EQ(0u, deleteVolumeRequests.size());
 
   Future<Nothing> deleteVolumeCall = FUTURE_DISPATCH(
-      _, &StorageLocalResourceProviderProcess::__call<csi::v0::DELETE_VOLUME>);
+      _, &csi::v0::VolumeManagerProcess::__call<csi::v0::DeleteVolumeResponse>);
 
   // Return `DEADLINE_EXCEEDED` for the first `DeleteVolume` call.
   deleteVolumeResults.put(
@@ -5150,7 +5061,7 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
 
   AWAIT_READY(deleteVolumeCall);
 
-  Duration deleteVolumeBackoff = DEFAULT_CSI_RETRY_BACKOFF_FACTOR;
+  Duration deleteVolumeBackoff = csi::v0::DEFAULT_CSI_RETRY_BACKOFF_FACTOR;
 
   // Settle the clock to ensure that the retry timer has been set, then advance
   // the clock by the maximum backoff to trigger a retry.
@@ -5160,8 +5071,7 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
   // Return `UNAVAILABLE` for subsequent `DeleteVolume` calls.
   for (size_t i = 1; i < numRetryableErrors; i++) {
     AWAIT_READY(deleteVolumeRequests.get())
-      << "Failed to wait for " << csi::v0::DELETE_VOLUME << " call #"
-      << (i + 1);
+      << "Failed to wait for DeleteVolumeRequest #" << (i + 1);
 
     // Settle the clock to verify that there is no more outstanding request.
     Clock::settle();
@@ -5169,14 +5079,14 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
 
     deleteVolumeCall = FUTURE_DISPATCH(
         _,
-        &StorageLocalResourceProviderProcess::__call<csi::v0::DELETE_VOLUME>);
+        &csi::v0::VolumeManagerProcess::__call<csi::v0::DeleteVolumeResponse>);
 
     deleteVolumeResults.put(StatusError(grpc::Status(grpc::UNAVAILABLE, "")));
 
     AWAIT_READY(deleteVolumeCall);
 
-    deleteVolumeBackoff =
-      std::min(deleteVolumeBackoff * 2, DEFAULT_CSI_RETRY_INTERVAL_MAX);
+    deleteVolumeBackoff = std::min(
+        deleteVolumeBackoff * 2, csi::v0::DEFAULT_CSI_RETRY_INTERVAL_MAX);
 
     // Settle the clock to ensure that the retry timer has been set, then
     // advance the clock by the maximum backoff to trigger a retry.
@@ -5185,8 +5095,7 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
   }
 
   AWAIT_READY(deleteVolumeRequests.get())
-    << "Failed to wait for " << csi::v0::DELETE_VOLUME << " call #"
-    << (numRetryableErrors + 1);
+    << "Failed to wait for DeleteVolumeRequest #" << (numRetryableErrors + 1);
 
   // Settle the clock to verify that there is no more outstanding request.
   Clock::settle();
@@ -5204,21 +5113,12 @@ TEST_F(StorageLocalResourceProviderTest, RetryRpcWithExponentialBackoff)
   EXPECT_TRUE(metricEquals("master/operations/failed", 1));
   EXPECT_TRUE(metricEquals("master/operations/finished", 1));
 
-  EXPECT_TRUE(metricEquals(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.CreateVolume/successes"),
-      1));
-
-  EXPECT_TRUE(metricEquals(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.CreateVolume/errors"),
-      numRetryableErrors));
-
-  EXPECT_TRUE(metricEquals(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.DeleteVolume/successes"),
-      0));
-
-  EXPECT_TRUE(metricEquals(metricName(
-      "csi_plugin/rpcs/csi.v0.Controller.DeleteVolume/errors"),
-      numRetryableErrors + 1));
+  // There should be 1 finished and 10 failed `CreateVolume` calls, and 11
+  // failed `DeleteVolume` calls.
+  EXPECT_TRUE(metricEquals(
+      metricName("csi_plugin/rpcs_finished"), numFinishedStartupRpcs + 1));
+  EXPECT_TRUE(metricEquals(
+      metricName("csi_plugin/rpcs_failed"), numRetryableErrors * 2 + 1));
 }
 
 

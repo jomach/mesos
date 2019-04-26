@@ -43,6 +43,9 @@ layout: community_section
 
     <p>All slack communication is publicly archived <a href="http://mesos.slackarchive.io">here</a>.</p>
 
+    <p>Thank you <a href="https://www.criteo.com">Criteo</a> for sponsoring Slack standard plan.</p>
+
+
     <h3 name="ircchannel">IRC </h3>
     <p> If you want to connect to our slack team through an IRC client please click <a href="https://my.slack.com/gateways">here</a> after signing up.</p>
 
@@ -114,14 +117,13 @@ layout: community_section
               Containerization
             </td>
             <td>
-              <a href="mailto:yujie.jay@gmail.com">Jie Yu</a>
+              <a href="mailto:yujie.jay@gmail.com;gilbert@apache.org">Jie Yu, Gilbert Song</a>
             </td>
             <td>
               #containerizer
             </td>
             <td>
-
-              <a href="https://docs.google.com/document/d/1z55a7tLZFoRWVuUxz1FZwgxkHeugtc2nHR89skFXSpU/edit?usp=sharing">Every other Thursday at 9:00 AM PST</a>
+              <a href="https://docs.google.com/document/d/1z55a7tLZFoRWVuUxz1FZwgxkHeugtc2nHR89skFXSpU/edit?usp=sharing">Monthly on the first Thursday at 9:00 AM PST</a>
             </td>
           </tr>
           <tr>

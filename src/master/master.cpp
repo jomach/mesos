@@ -2550,6 +2550,108 @@ void Master::reregisterFramework(
 }
 
 
+Option<Error> Master::validateFrameworkSubscription(
+  const scheduler::Call::Subscribe& subscribe) const
+{
+  const FrameworkInfo& frameworkInfo = subscribe.framework_info();
+  Option<Error> validationError =
+    validation::framework::validate(frameworkInfo);
+
+  if (!validationError.isNone()){
+    return validationError;
+  }
+
+  // Validate that resubscribing framework does not attempt
+  // to change its principal.
+  if (frameworkInfo.has_id() && !frameworkInfo.id().value().empty()) {
+    const Framework* framework = getFramework(frameworkInfo.id());
+
+    // TODO(asekretenko): Masters do not store `FrameworkInfo` messages in the
+    // replicated log, so it is possible that the previous principal is still
+    // unknown at the time of re-registration. This has to be changed if we
+    // decide to start storing `FrameworkInfo` messages.
+    if (framework != nullptr) {
+      Option<string> oldPrincipal;
+      if (framework->info.has_principal()) {
+          oldPrincipal = framework->info.principal();
+      }
+
+      Option<string> newPrincipal;
+      if (frameworkInfo.has_principal()) {
+        newPrincipal = frameworkInfo.principal();
+      }
+
+      if (oldPrincipal != newPrincipal) {
+        LOG(WARNING)
+          << "Framework " << frameworkInfo.id() << " which had a principal '"
+          << (oldPrincipal.isSome() ? oldPrincipal.get() : "<NONE>")
+          << "' tried to (re)subscribe with a new principal '"
+          << (newPrincipal.isSome() ? newPrincipal.get() : "<NONE>")
+          << "'";
+
+        return Error("Changing framework's principal is not allowed.");
+      }
+    }
+  }
+
+  // Check the framework's role(s) against the whitelist.
+  set<string> invalidRoles;
+
+  if (protobuf::frameworkHasCapability(
+          frameworkInfo,
+          FrameworkInfo::Capability::MULTI_ROLE)) {
+    foreach (const string& role, frameworkInfo.roles()) {
+      if (!isWhitelistedRole(role)) {
+        invalidRoles.insert(role);
+      }
+    }
+  } else {
+    if (!isWhitelistedRole(frameworkInfo.role())) {
+      invalidRoles.insert(frameworkInfo.role());
+    }
+  }
+
+  if (!invalidRoles.empty()) {
+    return Error("Roles " + stringify(invalidRoles) +
+                 " are not present in the master's --roles");
+  }
+
+  // Ensure each of the suppressed role is contained in the list of roles.
+  set<string> frameworkRoles = protobuf::framework::getRoles(frameworkInfo);
+  // The suppressed roles must be contained within the list of all
+  // roles for the framwork.
+  foreach (const string& role, subscribe.suppressed_roles()) {
+    if (!frameworkRoles.count(role)) {
+      return Error("Suppressed role '" + role +
+                   "' is not contained in the list of roles");
+    }
+  }
+
+  // TODO(vinod): Deprecate this in favor of authorization.
+  if (frameworkInfo.user() == "root" && !flags.root_submissions) {
+    return Error("User 'root' is not allowed to run frameworks"
+                 " without --root_submissions set");
+  }
+
+  if (frameworkInfo.has_id() && isCompletedFramework(frameworkInfo.id())) {
+    // This could happen if a framework tries to subscribe after its failover
+    // timeout has elapsed, or it has been torn down via the operator API,
+    // or it unregistered itself by calling 'stop()' on the scheduler driver.
+    //
+    // TODO(vinod): Master should persist admitted frameworks to the
+    // registry and remove them from it after failover timeout.
+    return Error("Framework has been removed");
+  }
+
+  if (!isValidFailoverTimeout(frameworkInfo)) {
+    return Error("The framework failover_timeout (" +
+                 stringify(frameworkInfo.failover_timeout()) +
+                 ") is invalid");
+  }
+  return Option<Error>::none();
+}
+
+
 void Master::subscribe(
     StreamingHttpConnection<v1::scheduler::Event> http,
     const scheduler::Call::Subscribe& subscribe)
@@ -2569,72 +2671,7 @@ void Master::subscribe(
             << " HTTP framework '" << frameworkInfo.name() << "'";
 
   Option<Error> validationError =
-    validation::framework::validate(frameworkInfo);
-
-  if (validationError.isNone()) {
-    // Check the framework's role(s) against the whitelist.
-    set<string> invalidRoles;
-
-    if (protobuf::frameworkHasCapability(
-            frameworkInfo,
-            FrameworkInfo::Capability::MULTI_ROLE)) {
-      foreach (const string& role, frameworkInfo.roles()) {
-        if (!isWhitelistedRole(role)) {
-          invalidRoles.insert(role);
-        }
-      }
-    } else {
-      if (!isWhitelistedRole(frameworkInfo.role())) {
-        invalidRoles.insert(frameworkInfo.role());
-      }
-    }
-
-    if (!invalidRoles.empty()) {
-      validationError = Error("Roles " + stringify(invalidRoles) +
-                              " are not present in master's --roles");
-    }
-  }
-
-  // Ensure each of the suppressed role is contained in the list of roles.
-  set<string> frameworkRoles = protobuf::framework::getRoles(frameworkInfo);
-  set<string> suppressedRoles = set<string>(
-      subscribe.suppressed_roles().begin(), subscribe.suppressed_roles().end());
-
-  if (validationError.isNone()) {
-    // The suppressed roles must be contained within the list of all
-    // roles for the framwork.
-    foreach (const string& role, suppressedRoles) {
-      if (!frameworkRoles.count(role)) {
-        validationError = Error("Suppressed role '" + role +
-                                "' is not contained in the list of roles");
-
-        break;
-      }
-    }
-  }
-
-  // TODO(vinod): Deprecate this in favor of authorization.
-  if (validationError.isNone() &&
-      frameworkInfo.user() == "root" && !flags.root_submissions) {
-    validationError = Error("User 'root' is not allowed to run frameworks"
-                            " without --root_submissions set");
-  }
-
-  if (validationError.isNone() && frameworkInfo.has_id() &&
-      isCompletedFramework(frameworkInfo.id())) {
-    // This could happen if a framework tries to subscribe after its failover
-    // timeout has elapsed, or it has been torn down via the operator API.
-    //
-    // TODO(vinod): Master should persist admitted frameworks to the
-    // registry and remove them from it after failover timeout.
-    validationError = Error("Framework has been removed");
-  }
-
-  if (validationError.isNone() && !isValidFailoverTimeout(frameworkInfo)) {
-    validationError = Error("The framework failover_timeout (" +
-                            stringify(frameworkInfo.failover_timeout()) +
-                            ") is invalid");
-  }
+    validateFrameworkSubscription(subscribe);
 
   if (validationError.isSome()) {
     LOG(INFO) << "Refusing subscription of framework"
@@ -2648,6 +2685,10 @@ void Master::subscribe(
     http.close();
     return;
   }
+
+  set<string> suppressedRoles = set<string>(
+      subscribe.suppressed_roles().begin(),
+      subscribe.suppressed_roles().end());
 
   // Need to disambiguate for the compiler.
   void (Master::*_subscribe)(
@@ -2833,73 +2874,7 @@ void Master::subscribe(
   }
 
   Option<Error> validationError =
-    validation::framework::validate(frameworkInfo);
-
-  if (validationError.isNone()) {
-    // Check the framework's role(s) against the whitelist.
-    set<string> invalidRoles;
-
-    if (protobuf::frameworkHasCapability(
-            frameworkInfo,
-            FrameworkInfo::Capability::MULTI_ROLE)) {
-      foreach (const string& role, frameworkInfo.roles()) {
-        if (!isWhitelistedRole(role)) {
-          invalidRoles.insert(role);
-        }
-      }
-    } else {
-      if (!isWhitelistedRole(frameworkInfo.role())) {
-        invalidRoles.insert(frameworkInfo.role());
-      }
-    }
-
-    if (!invalidRoles.empty()) {
-      validationError = Error("Roles " + stringify(invalidRoles) +
-                              " are not present in the master's --roles");
-    }
-  }
-
-  // Ensure each of the suppressed role is contained in the list of roles.
-  set<string> frameworkRoles = protobuf::framework::getRoles(frameworkInfo);
-  set<string> suppressedRoles = set<string>(
-      subscribe.suppressed_roles().begin(), subscribe.suppressed_roles().end());
-
-  if (validationError.isNone()) {
-    // The suppressed roles must be contained within the list of all
-    // roles for the framwork.
-    foreach (const string& role, suppressedRoles) {
-      if (!frameworkRoles.count(role)) {
-        validationError = Error("Suppressed role '" + role +
-                                "' is not contained in the list of roles");
-
-        break;
-      }
-    }
-  }
-
-  // TODO(vinod): Deprecate this in favor of authorization.
-  if (validationError.isNone() &&
-      frameworkInfo.user() == "root" && !flags.root_submissions) {
-    validationError = Error("User 'root' is not allowed to run frameworks"
-                            " without --root_submissions set");
-  }
-
-  if (validationError.isNone() && frameworkInfo.has_id() &&
-      isCompletedFramework(frameworkInfo.id())) {
-    // This could happen if a framework tries to subscribe after its
-    // failover timeout has elapsed or it unregistered itself by
-    // calling 'stop()' on the scheduler driver.
-    //
-    // TODO(vinod): Master should persist admitted frameworks to the
-    // registry and remove them from it after failover timeout.
-    validationError = Error("Framework has been removed");
-  }
-
-  if (validationError.isNone() && !isValidFailoverTimeout(frameworkInfo)) {
-    validationError = Error("The framework failover_timeout (" +
-                            stringify(frameworkInfo.failover_timeout()) +
-                            ") is invalid");
-  }
+    validateFrameworkSubscription(subscribe);
 
   // Note that re-authentication errors are already handled above.
   if (validationError.isNone()) {
@@ -2932,6 +2907,10 @@ void Master::subscribe(
 
     frameworkInfo.set_principal(authenticated[from]);
   }
+
+  set<string> suppressedRoles = set<string>(
+      subscribe.suppressed_roles().begin(),
+      subscribe.suppressed_roles().end());
 
   // Need to disambiguate for the compiler.
   void (Master::*_subscribe)(
@@ -9205,18 +9184,100 @@ void Master::_markUnreachable(
 }
 
 
-void Master::markGone(Slave* slave, const TimeInfo& goneTime)
+void Master::markGone(const SlaveID& slaveId, const TimeInfo& goneTime)
 {
-  CHECK_NOTNULL(slave);
-  CHECK(slaves.markingGone.contains(slave->info.id()));
-  slaves.markingGone.erase(slave->info.id());
+  CHECK(slaves.markingGone.contains(slaveId));
 
-  slaves.gone[slave->id] = goneTime;
+  slaves.markingGone.erase(slaveId);
+
+  slaves.gone[slaveId] = goneTime;
+
+  const string message = "Agent has been marked gone";
+
+  Slave* slave = slaves.registered.get(slaveId);
+
+  // If the `Slave` struct does not exist, then the agent
+  // must be either recovered or unreachable.
+  if (slave == nullptr) {
+    CHECK(slaves.recovered.contains(slaveId) ||
+          slaves.unreachable.contains(slaveId));
+
+    // When a recovered agent is marked gone, we have no task metadata to use in
+    // order to send task status updates. We could retain this agent ID and send
+    // updates upon reregistration but do not currently do this. See MESOS-9739.
+    if (slaves.recovered.contains(slaveId)) {
+      return;
+    }
+
+    slaves.unreachable.erase(slaveId);
+
+    // TODO(vinod): Consider moving these tasks into `completedTasks` by
+    // transitioning them to a terminal state and sending status updates.
+    // But it's not clear what this state should be. If a framework
+    // reconciles these tasks after this point it would get `TASK_UNKNOWN`
+    // which seems appropriate but we don't keep tasks in this state in-memory.
+    if (slaves.unreachableTasks.contains(slaveId)) {
+      foreachkey (const FrameworkID& frameworkId,
+                  slaves.unreachableTasks.at(slaveId)) {
+        Framework* framework = getFramework(frameworkId);
+        if (framework == nullptr) {
+          continue;
+        }
+
+        TaskState newTaskState = TASK_GONE_BY_OPERATOR;
+        TaskStatus::Reason newTaskReason =
+          TaskStatus::REASON_SLAVE_REMOVED_BY_OPERATOR;
+
+        if (!framework->capabilities.partitionAware) {
+          newTaskState = TASK_LOST;
+          newTaskReason = TaskStatus::REASON_SLAVE_REMOVED;
+        }
+
+        foreach (const TaskID& taskId,
+                 slaves.unreachableTasks.at(slaveId).get(frameworkId)) {
+          if (framework->unreachableTasks.contains(taskId)) {
+            const Owned<Task>& task = framework->unreachableTasks.at(taskId);
+
+            const StatusUpdate& update = protobuf::createStatusUpdate(
+                task->framework_id(),
+                task->slave_id(),
+                task->task_id(),
+                newTaskState,
+                TaskStatus::SOURCE_MASTER,
+                None(),
+                message,
+                newTaskReason,
+                (task->has_executor_id()
+                   ? Option<ExecutorID>(task->executor_id())
+                   : None()));
+
+            updateTask(task.get(), update);
+
+            if (!framework->connected()) {
+              LOG(WARNING) << "Dropping update " << update
+                           << " for disconnected "
+                           << " framework " << frameworkId;
+            } else {
+              forward(update, UPID(), framework);
+            }
+
+            // Move task from unreachable map to completed map.
+            framework->addCompletedTask(std::move(*task));
+            framework->unreachableTasks.erase(taskId);
+          }
+        }
+      }
+
+      slaves.unreachableTasks.erase(slaveId);
+    }
+
+    return;
+  }
 
   // Shutdown the agent if it transitioned to gone.
-  ShutdownMessage message;
-  message.set_message("Agent has been marked gone");
-  send(slave->pid, message);
+  ShutdownMessage shutdownMessage;
+  shutdownMessage.set_message(message);
+  send(slave->pid, shutdownMessage);
 
   // Notify frameworks that their operations have been transitioned
   // to status `OPERATION_GONE_BY_OPERATOR`.
@@ -9225,7 +9286,7 @@ void Master::markGone(Slave* slave, const TimeInfo& goneTime)
     OperationState::OPERATION_GONE_BY_OPERATOR,
     "Agent has been marked gone");
 
-  __removeSlave(slave, "Agent has been marked gone", None());
+  __removeSlave(slave, message, None());
 }
 
 
@@ -10543,15 +10604,30 @@ void Master::recoverFramework(
           slave->totalResources += consumedUnallocated;
           slave->usedResources[framework->id()] += consumed.get();
 
-          allocator->updateSlave(slave->id, slave->info, slave->totalResources);
+          hashmap<FrameworkID, Resources> usedResources;
+          usedResources.put(framework->id(), consumed.get());
 
-          // NOTE: The allocation of these orphan operation resources will be
-          // updated in `addFramework` below.
+          // This call to `addResourceProvider()` adds orphan operation
+          // resources back to the agent's total and used resources. This
+          // prevents these resources from being offered while the operation is
+          // still pending.
+          //
+          // NOTE: We intentionally call `addResourceProvider()` before we call
+          // `addFramework()` below because if the order were reversed, these
+          // resources would be incorrectly tracked twice in the allocator.
+          allocator->addResourceProvider(
+              slave->id,
+              consumedUnallocated,
+              usedResources);
         }
       }
     }
   }
 
+  // NOTE: We intentionally call `addFramework()` after we called
+  // `addResourceProvider()` above because if the order were reversed, the
+  // resources of orphan operations would be incorrectly tracked twice in the
+  // allocator.
   addFramework(framework, suppressedRoles);
 }
 
@@ -11717,7 +11793,10 @@ void Master::removeTask(Task* task, bool unreachable)
               << " on agent " << *slave;
   }
 
-  slaves.unreachableTasks[slave->id].put(task->framework_id(), task->task_id());
+  if (unreachable) {
+    slaves.unreachableTasks[slave->id].put(
+        task->framework_id(), task->task_id());
+  }
 
   // Remove from framework.
   Framework* framework = getFramework(task->framework_id());
@@ -12322,7 +12401,7 @@ void Master::removeInverseOffer(InverseOffer* inverseOffer, bool rescind)
 }
 
 
-bool Master::isCompletedFramework(const FrameworkID& frameworkId)
+bool Master::isCompletedFramework(const FrameworkID& frameworkId) const
 {
   return frameworks.completed.contains(frameworkId);
 }

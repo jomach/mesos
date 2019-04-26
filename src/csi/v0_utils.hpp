@@ -14,68 +14,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef __CSI_UTILS_HPP__
-#define __CSI_UTILS_HPP__
+#ifndef __CSI_V0_UTILS_HPP__
+#define __CSI_V0_UTILS_HPP__
 
-#include <ostream>
-#include <type_traits>
+#include <google/protobuf/message.h>
 
-#include <csi/spec.hpp>
-
-#include <google/protobuf/map.h>
-
-#include <google/protobuf/util/json_util.h>
-
-#include <mesos/mesos.hpp>
+#include <mesos/csi/types.hpp>
+#include <mesos/csi/v0.hpp>
 
 #include <stout/foreach.hpp>
-#include <stout/try.hpp>
 #include <stout/unreachable.hpp>
-
-#include "csi/state.hpp"
-
-namespace csi {
-namespace v0 {
-
-bool operator==(
-    const ControllerServiceCapability& left,
-    const ControllerServiceCapability& right);
-
-
-bool operator==(const VolumeCapability& left, const VolumeCapability& right);
-
-
-inline bool operator!=(
-    const VolumeCapability& left,
-    const VolumeCapability& right)
-{
-  return !(left == right);
-}
-
-
-std::ostream& operator<<(
-    std::ostream& stream,
-    const ControllerServiceCapability::RPC::Type& type);
-
-
-// Default imprementation for output protobuf messages in namespace
-// `csi`. Note that any non-template overloading of the output operator
-// would take precedence over this function template.
-template <
-    typename Message,
-    typename std::enable_if<std::is_convertible<
-        Message*, google::protobuf::Message*>::value, int>::type = 0>
-std::ostream& operator<<(std::ostream& stream, const Message& message)
-{
-  // NOTE: We use Google's JSON utility functions for proto3.
-  std::string output;
-  google::protobuf::util::MessageToJsonString(message, &output);
-  return stream << output;
-}
-
-} // namespace v0 {
-} // namespace csi {
-
 
 namespace mesos {
 namespace csi {
@@ -85,7 +33,8 @@ struct PluginCapabilities
 {
   PluginCapabilities() = default;
 
-  template <typename Iterable> PluginCapabilities(const Iterable& capabilities)
+  template <typename Iterable>
+  PluginCapabilities(const Iterable& capabilities)
   {
     foreach (const auto& capability, capabilities) {
       if (capability.has_service() &&
@@ -97,6 +46,10 @@ struct PluginCapabilities
           case PluginCapability::Service::CONTROLLER_SERVICE:
             controllerService = true;
             break;
+
+          // NOTE: We avoid using a default clause for the following values in
+          // proto3's open enum to enable the compiler to detect missing enum
+          // cases for us. See: https://github.com/google/protobuf/issues/3917
           case google::protobuf::kint32min:
           case google::protobuf::kint32max:
             UNREACHABLE();
@@ -135,6 +88,10 @@ struct ControllerCapabilities
           case ControllerServiceCapability::RPC::GET_CAPACITY:
             getCapacity = true;
             break;
+
+          // NOTE: We avoid using a default clause for the following values in
+          // proto3's open enum to enable the compiler to detect missing enum
+          // cases for us. See: https://github.com/google/protobuf/issues/3917
           case google::protobuf::kint32min:
           case google::protobuf::kint32max:
             UNREACHABLE();
@@ -154,7 +111,8 @@ struct NodeCapabilities
 {
   NodeCapabilities() = default;
 
-  template <typename Iterable> NodeCapabilities(const Iterable& capabilities)
+  template <typename Iterable>
+  NodeCapabilities(const Iterable& capabilities)
   {
     foreach (const auto& capability, capabilities) {
       if (capability.has_rpc() &&
@@ -165,6 +123,10 @@ struct NodeCapabilities
           case NodeServiceCapability::RPC::STAGE_UNSTAGE_VOLUME:
             stageUnstageVolume = true;
             break;
+
+          // NOTE: We avoid using a default clause for the following values in
+          // proto3's open enum to enable the compiler to detect missing enum
+          // cases for us. See: https://github.com/google/protobuf/issues/3917
           case google::protobuf::kint32min:
           case google::protobuf::kint32max:
             UNREACHABLE();
@@ -176,8 +138,23 @@ struct NodeCapabilities
   bool stageUnstageVolume = false;
 };
 
+
+// Helpers to devolve CSI v0 protobufs to their unversioned counterparts.
+types::VolumeCapability devolve(const VolumeCapability& capability);
+
+google::protobuf::RepeatedPtrField<types::VolumeCapability> devolve(
+    const google::protobuf::RepeatedPtrField<VolumeCapability>& capabilities);
+
+
+// Helpers to evolve unversioned CSI protobufs to their v0 counterparts.
+VolumeCapability evolve(const types::VolumeCapability& capability);
+
+google::protobuf::RepeatedPtrField<VolumeCapability> evolve(
+    const google::protobuf::RepeatedPtrField<types::VolumeCapability>&
+      capabilities);
+
 } // namespace v0 {
 } // namespace csi {
 } // namespace mesos {
 
-#endif // __CSI_UTILS_HPP__
+#endif // __CSI_V0_UTILS_HPP__

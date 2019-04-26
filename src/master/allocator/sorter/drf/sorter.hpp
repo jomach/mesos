@@ -88,6 +88,8 @@ public:
 
   const ResourceQuantities& allocationScalarQuantities(
       const std::string& clientPath) const override;
+  const ResourceQuantities& allocationScalarQuantities()
+      const override;
 
   hashmap<std::string, Resources> allocation(
       const SlaveID& slaveId) const override;
@@ -227,6 +229,7 @@ struct DRFSorter::Node
   // label for virtual leaf nodes.
   std::string path;
 
+  // NOTE: Not computed for root node.
   double share;
 
   // Cached weight of the node, access this through `getWeight()`.

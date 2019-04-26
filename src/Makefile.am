@@ -26,7 +26,8 @@ include ../3rdparty/versions.am
 # them include $(top_builddir) as appropriate.
 BOOST = 3rdparty/boost-$(BOOST_VERSION)
 CONCURRENTQUEUE = 3rdparty/concurrentqueue-$(CONCURRENTQUEUE_VERSION)
-CSI = 3rdparty/csi-$(CSI_VERSION)
+CSI_V0 = 3rdparty/csi-$(CSI_V0_VERSION)
+CSI_V1 = 3rdparty/csi-$(CSI_V1_VERSION)
 ELFIO = 3rdparty/elfio-$(ELFIO_VERSION)
 GLOG = 3rdparty/glog-$(GLOG_VERSION)
 GMOCK = $(GOOGLETEST)/googlemock
@@ -139,6 +140,9 @@ MESOS_CPPFLAGS += -I../include
 # Protobuf headers that depend on mesos.pb.h need this.
 MESOS_CPPFLAGS += -I../include/mesos
 
+# Set up include paths for the protocol buffer compiler.
+PROTOCFLAGS = -I$(top_srcdir)/include -I$(srcdir) -I../$(CSI_V0) -I../$(CSI_V1)
+
 # Header only dependencies will be ignored for --disable-bundled.
 #
 # For non-convenience libraries we need to link them in to make the shared
@@ -247,10 +251,12 @@ if WITH_BUNDLED_PROTOBUF
 MESOS_CPPFLAGS += -I../$(PROTOBUF)/src
 LIB_PROTOBUF = ../$(PROTOBUF)/src/libprotobuf.la
 PROTOC = ../$(PROTOBUF)/src/protoc
+PROTOCFLAGS += -I../$(PROTOBUF)/src
 else
 LIB_PROTOBUF = -lprotobuf
 LDADD += -lprotobuf
 PROTOC = @PROTOCOMPILER@
+PROTOCFLAGS += @PROTOBUF_PROTOCFLAGS@
 endif
 
 if WITH_BUNDLED_RAPIDJSON
@@ -270,15 +276,6 @@ LIB_ZOOKEEPER = -lzookeeper_mt
 LDADD += -lzookeeper_mt
 endif
 
-# Set up include paths for the protocol buffer compiler.
-PROTOCFLAGS = -I$(top_srcdir)/include -I$(srcdir) -I../$(CSI)
-
-# TODO(josephw): This is a temporary include directory which points to the
-# generated CSI protocol buffer code. Derivative protocol buffers need
-# this include in order to build. When the 3rdparty CSI repo builds its own
-# generated code, this can be changed to include that directory instead.
-MESOS_CPPFLAGS += -I../include/csi
-
 # README: we build the Mesos library out of a collection of
 # convenience libraries (that is, libraries that do not get installed
 # but we can use as building blocks to vary compile flags as necessary
@@ -294,6 +291,7 @@ APPC_SPEC_PROTO = $(top_srcdir)/include/mesos/appc/spec.proto
 AUTHENTICATION_PROTO = $(top_srcdir)/include/mesos/authentication/authentication.proto
 AUTHORIZATION_PROTO = $(top_srcdir)/include/mesos/authorizer/authorizer.proto
 CONTAINERIZER_PROTO = $(top_srcdir)/include/mesos/slave/containerizer.proto
+CSI_TYPES_PROTO = $(top_srcdir)/include/mesos/csi/types.proto
 DOCKER_SPEC_PROTO = $(top_srcdir)/include/mesos/docker/spec.proto
 DOCKER_V1_PROTO = $(top_srcdir)/include/mesos/docker/v1.proto
 DOCKER_V2_PROTO = $(top_srcdir)/include/mesos/docker/v2.proto
@@ -423,10 +421,16 @@ CXX_PROTOS +=								\
   resource_provider/storage/disk_profile.pb.h
 
 CXX_CSI_PROTOS =							\
-  ../include/csi/csi.grpc.pb.cc						\
-  ../include/csi/csi.grpc.pb.h						\
-  ../include/csi/csi.pb.cc						\
-  ../include/csi/csi.pb.h						\
+  ../include/csi/v0/csi.grpc.pb.cc					\
+  ../include/csi/v0/csi.grpc.pb.h					\
+  ../include/csi/v0/csi.pb.cc						\
+  ../include/csi/v0/csi.pb.h						\
+  ../include/csi/v1/csi.grpc.pb.cc					\
+  ../include/csi/v1/csi.grpc.pb.h					\
+  ../include/csi/v1/csi.pb.cc						\
+  ../include/csi/v1/csi.pb.h						\
+  ../include/mesos/csi/types.pb.cc					\
+  ../include/mesos/csi/types.pb.h					\
   csi/state.pb.cc							\
   csi/state.pb.h
 
@@ -496,14 +500,13 @@ CLEANFILES +=								\
 %.pb.cc %.pb.h: %.proto
 	$(PROTOC) $(PROTOCFLAGS) --cpp_out=. $^
 
-../include/csi/%.pb.cc ../include/csi/%.pb.h: ../$(CSI)/%.proto
-	$(MKDIR_P) $(@D)
-	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include/csi $^
+../include/%.grpc.pb.cc ../include/%.grpc.pb.h ../include/%.pb.cc ../include/%.pb.h: ../$(CSI_V0)/%.proto
+	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include --grpc_out=../include	\
+		--plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $^
 
-../include/csi/%.grpc.pb.cc ../include/csi/%.grpc.pb.h: ../$(CSI)/%.proto
-	$(MKDIR_P) $(@D)
-	$(PROTOC) $(PROTOCFLAGS) --grpc_out=../include/csi $^		\
-	          --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN)
+../include/%.grpc.pb.cc ../include/%.grpc.pb.h ../include/%.pb.cc ../include/%.pb.h: ../$(CSI_V1)/%.proto
+	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include --grpc_out=../include	\
+		--plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $^
 
 # Targets for generating Java protocol buffer code.
 java/generated/org/apache/mesos/executor/Protos.java: $(EXECUTOR_PROTO)
@@ -701,6 +704,30 @@ authorizer_HEADERS =							\
 nodist_authorizer_HEADERS =						\
   ../include/mesos/authorizer/acls.pb.h					\
   ../include/mesos/authorizer/authorizer.pb.h
+
+csidir = $(pkgincludedir)/csi
+
+csi_HEADERS =								\
+  $(top_srcdir)/include/mesos/csi/types.hpp				\
+  $(top_srcdir)/include/mesos/csi/types.proto				\
+  $(top_srcdir)/include/mesos/csi/v0.hpp				\
+  $(top_srcdir)/include/mesos/csi/v1.hpp
+
+nodist_csi_HEADERS =							\
+  ../include/mesos/csi/types.pb.h
+
+# Install the generated CSI headers into $PREFIX/include.
+csi_v0dir = $(includedir)/csi/v0
+
+nodist_csi_v0_HEADERS =							\
+  ../include/csi/v0/csi.grpc.pb.h					\
+  ../include/csi/v0/csi.pb.h
+
+csi_v1dir = $(includedir)/csi/v1
+
+nodist_csi_v1_HEADERS =							\
+  ../include/csi/v1/csi.grpc.pb.h					\
+  ../include/csi/v1/csi.pb.h
 
 dockerdir = $(pkgincludedir)/docker
 
@@ -1516,8 +1543,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   resource_provider/storage/disk_profile_utils.cpp			\
   resource_provider/storage/disk_profile_utils.hpp			\
   resource_provider/storage/provider.cpp				\
-  resource_provider/storage/provider.hpp				\
-  resource_provider/storage/provider_process.hpp
+  resource_provider/storage/provider.hpp
 
 libmesos_no_3rdparty_la_CPPFLAGS = $(MESOS_CPPFLAGS)
 
@@ -1552,21 +1578,33 @@ libmesos_no_3rdparty_la_LIBADD += libbuild.la
 # Convenience library for build the CSI client.
 noinst_LTLIBRARIES += libcsi.la
 libcsi_la_SOURCES =							\
-  csi/client.cpp							\
-  csi/client.hpp							\
+  csi/types.cpp								\
   csi/metrics.cpp							\
   csi/metrics.hpp							\
   csi/paths.cpp								\
   csi/paths.hpp								\
-  csi/rpc.cpp								\
-  csi/rpc.hpp								\
   csi/service_manager.cpp						\
   csi/service_manager.hpp						\
   csi/state.hpp								\
   csi/state.proto							\
-  csi/utils.cpp								\
-  csi/utils.hpp								\
-  ../include/csi/spec.hpp
+  csi/v0.cpp								\
+  csi/v0_client.cpp							\
+  csi/v0_client.hpp							\
+  csi/v0_utils.cpp							\
+  csi/v0_utils.hpp							\
+  csi/v0_volume_manager.cpp						\
+  csi/v0_volume_manager.hpp						\
+  csi/v0_volume_manager_process.hpp					\
+  csi/v1.cpp								\
+  csi/v1_client.cpp							\
+  csi/v1_client.hpp							\
+  csi/v1_utils.cpp							\
+  csi/v1_utils.hpp							\
+  csi/v1_volume_manager.cpp						\
+  csi/v1_volume_manager.hpp						\
+  csi/v1_volume_manager_process.hpp					\
+  csi/volume_manager.cpp						\
+  csi/volume_manager.hpp
 
 nodist_libcsi_la_SOURCES = $(CXX_CSI_PROTOS)
 libcsi_la_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -1643,6 +1681,7 @@ libmesos_la_SOURCES =							\
   $(AUTHENTICATION_PROTO)						\
   $(AUTHORIZATION_PROTO)						\
   $(CONTAINERIZER_PROTO)						\
+  $(CSI_TYPES_PROTO)							\
   $(EXECUTOR_PROTO)							\
   $(DOCKER_SPEC_PROTO)							\
   $(DOCKER_V1_PROTO)							\
@@ -2521,6 +2560,7 @@ mesos_tests_SOURCES =						\
   tests/cram_md5_authentication_tests.cpp			\
   tests/credentials_tests.cpp					\
   tests/csi_client_tests.cpp					\
+  tests/csi_utils_tests.cpp					\
   tests/default_executor_tests.cpp				\
   tests/disk_profile_adaptor_tests.cpp				\
   tests/disk_profile_server.hpp					\

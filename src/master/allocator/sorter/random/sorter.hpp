@@ -29,6 +29,7 @@
 
 #include <stout/check.hpp>
 #include <stout/hashmap.hpp>
+#include <stout/hashset.hpp>
 #include <stout/option.hpp>
 
 #include "common/resource_quantities.hpp"
@@ -87,6 +88,8 @@ public:
 
   const ResourceQuantities& allocationScalarQuantities(
       const std::string& clientPath) const override;
+  const ResourceQuantities& allocationScalarQuantities()
+      const override;
 
   hashmap<std::string, Resources> allocation(
       const SlaveID& slaveId) const override;
@@ -121,10 +124,45 @@ private:
   // returned.
   double getWeight(const Node* node) const;
 
+  // Get active internal nodes -- internal nodes that have at least
+  // one active leaf descendant.
+  hashset<Node*> activeInternalNodes() const;
+
   // Returns the client associated with the given path. Returns
   // nullptr if the path is not found or if the path identifies an
   // internal node in the tree (not a client).
   Node* find(const std::string& clientPath) const;
+
+  // Sorting related info are kept in memory to avoid recalculations.
+  struct SortInfo
+  {
+  public:
+    SortInfo(const RandomSorter* sorter_) : dirty(true), sorter(sorter_) {}
+
+    // Returns a pair of vectors which are active clients and
+    // their corresponding relative weights.
+    std::pair<std::vector<std::string>, std::vector<double>>
+    getClientsAndWeights();
+
+    // A dirty bit indicates whether the info is up-to-date
+    // and requires recalculation.
+    bool dirty;
+
+  private:
+    void updateRelativeWeights();
+
+    std::vector<std::string> clients;
+
+    // Relative weights of the `clients` above.
+    // Relative weight denotes the weight of an active leaf node relative to
+    // other active leaf nodes given their configured weights. The number here
+    // stands for the probability of a given node being shuffled to the 1st in
+    // all the nodes in a random shuffle. Intuitively, the sum of all relative
+    // weights should be one.
+    std::vector<double> weights;
+
+    const RandomSorter* sorter;
+  } sortInfo;
 
   // Used for random number generation.
   std::mt19937 generator;

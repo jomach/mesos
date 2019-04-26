@@ -2605,7 +2605,8 @@ public:
       ContentType contentType,
       const std::shared_ptr<MockHTTPScheduler<Mesos, Event>>& scheduler,
       const Option<std::shared_ptr<mesos::master::detector::MasterDetector>>&
-          detector = None())
+          detector = None(),
+      const mesos::v1::Credential& credential = v1::DEFAULT_CREDENTIAL)
     : Mesos(
           master,
           contentType,
@@ -2619,7 +2620,7 @@ public:
                        scheduler,
                        this,
                        lambda::_1),
-          v1::DEFAULT_CREDENTIAL,
+          credential,
           detector) {}
 
   ~TestMesos() override
@@ -3086,8 +3087,18 @@ public:
     driver->start();
   }
 
+  void stop()
+  {
+    driver.reset();
+  }
+
   void connectedDefault()
   {
+    // Do nothing if this is asynchronously called after `stop` is invoked.
+    if (driver == nullptr) {
+      return;
+    }
+
     Call call;
     call.set_type(Call::SUBSCRIBE);
     call.mutable_subscribe()->mutable_resource_provider_info()->CopyFrom(info);
@@ -3097,6 +3108,11 @@ public:
 
   void subscribedDefault(const typename Event::Subscribed& subscribed)
   {
+    // Do nothing if this is asynchronously called after `stop` is invoked.
+    if (driver == nullptr) {
+      return;
+    }
+
     info.mutable_id()->CopyFrom(subscribed.provider_id());
 
     if (resources.isSome()) {
@@ -3122,6 +3138,11 @@ public:
 
   void operationDefault(const typename Event::ApplyOperation& operation)
   {
+    // Do nothing if this is asynchronously called after `stop` is invoked.
+    if (driver == nullptr) {
+      return;
+    }
+
     CHECK(info.has_id());
 
     Call call;
@@ -3196,6 +3217,11 @@ public:
 
   void publishDefault(const typename Event::PublishResources& publish)
   {
+    // Do nothing if this is asynchronously called after `stop` is invoked.
+    if (driver == nullptr) {
+      return;
+    }
+
     CHECK(info.has_id());
 
     Call call;

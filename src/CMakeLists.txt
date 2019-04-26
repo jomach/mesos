@@ -18,20 +18,16 @@
 #########################################
 include(MesosProtobuf)
 
-set(PUBLIC_PROTO_PATH "")
-set(PUBLIC_PROTOBUF_INCLUDE_DIR "")
 set(PUBLIC_PROTOBUF_SRC "")
-set(INTERNAL_PROTO_PATH "")
-set(INTERNAL_PROTOBUF_INCLUDE_DIR "")
 set(INTERNAL_PROTOBUF_SRC "")
 set(JAVA_PROTOBUF_SRC "")
 
 # Build the protobuf structs.
 #
 # NOTE: The following `PROTOC_GENERATE` calls will list append to
-# `PUBLIC_PROTO_PATH`, `PUBLIC_PROTOBUF_INCLUDE_DIR` and `PUBLIC_PROTOBUF_SRC`.
-# The GRPC option is a noop if gRPC is disabled.
-PROTOC_GENERATE(GRPC LIB csi TARGET csi)
+# `PUBLIC_PROTOBUF_SRC`. The GRPC option is a noop if gRPC is disabled.
+PROTOC_GENERATE(GRPC LIB csi_v0 TARGET csi/v0/csi)
+PROTOC_GENERATE(GRPC LIB csi_v1 TARGET csi/v1/csi)
 
 # NOTE: The following `PROTOC_GENERATE` calls will list append to
 # `PUBLIC_PROTOBUF_SRC`.
@@ -41,6 +37,7 @@ PROTOC_GENERATE(TARGET mesos/appc/spec)
 PROTOC_GENERATE(TARGET mesos/authentication/authentication)
 PROTOC_GENERATE(TARGET mesos/authorizer/acls)
 PROTOC_GENERATE(TARGET mesos/authorizer/authorizer)
+PROTOC_GENERATE(TARGET mesos/csi/types)
 PROTOC_GENERATE(TARGET mesos/docker/spec)
 PROTOC_GENERATE(TARGET mesos/docker/v1)
 PROTOC_GENERATE(TARGET mesos/docker/v2)
@@ -118,11 +115,7 @@ target_link_libraries(mesos-protobufs PUBLIC
 target_include_directories(
   mesos-protobufs
   PUBLIC
-  ${MESOS_PROTOBUF_HEADER_INCLUDE_DIRS}
-  ${PUBLIC_PROTOBUF_INCLUDE_DIR}
-
-  PRIVATE
-  ${INTERNAL_PROTOBUF_INCLUDE_DIR})
+  ${MESOS_PROTOBUF_HEADER_INCLUDE_DIRS})
 
 
 # BUILD JAVA ARTIFACTS.
@@ -240,12 +233,19 @@ set(COMMON_SRC
   common/values.cpp)
 
 set(CSI_SRC
-  csi/client.cpp
+  csi/types.cpp
   csi/metrics.cpp
   csi/paths.cpp
-  csi/rpc.cpp
   csi/service_manager.cpp
-  csi/utils.cpp)
+  csi/v0.cpp
+  csi/v0_client.cpp
+  csi/v0_utils.cpp
+  csi/v0_volume_manager.cpp
+  csi/v1.cpp
+  csi/v1_client.cpp
+  csi/v1_utils.cpp
+  csi/v1_volume_manager.cpp
+  csi/volume_manager.cpp)
 
 set(DOCKER_SRC
   docker/docker.cpp
