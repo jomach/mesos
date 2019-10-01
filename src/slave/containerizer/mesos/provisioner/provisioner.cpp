@@ -20,7 +20,9 @@
 
 #include <mesos/type_utils.hpp>
 
+#ifndef __WINDOWS__
 #include <mesos/docker/spec.hpp>
+#endif // __WINDOWS__
 
 #include <mesos/secret/resolver.hpp>
 
@@ -515,7 +517,7 @@ Future<ProvisionInfo> ProvisionerProcess::provision(
       }
 
       // Get and then provision image layers from the store.
-      return stores.get(image.type()).get()->get(image, defaultBackend)
+      return stores.at(image.type())->get(image, defaultBackend)
         .then(defer(
             self(),
             &Self::_provision,
@@ -568,11 +570,12 @@ Future<ProvisionInfo> ProvisionerProcess::_provision(
       containerId,
       backend);
 
-  return backends.get(backend).get()->provision(
+  return backends.at(backend)->provision(
       imageInfo.layers,
       rootfs,
       backendDir)
-    .then(defer(self(), [=]() -> Future<ProvisionInfo> {
+    .then(defer(self(), [=](const Option<vector<Path>>& ephemeral)
+    -> Future<ProvisionInfo> {
       const string path =
         provisioner::paths::getLayersFilePath(rootDir, containerId);
 
@@ -594,7 +597,7 @@ Future<ProvisionInfo> ProvisionerProcess::_provision(
       }
 
       return ProvisionInfo{
-          rootfs, imageInfo.dockerManifest, imageInfo.appcManifest};
+          rootfs, ephemeral, imageInfo.dockerManifest, imageInfo.appcManifest};
     }));
 }
 
@@ -701,7 +704,7 @@ Future<bool> ProvisionerProcess::_destroy(
                 << "' for container " << containerId;
 
       futures.push_back(
-          backends.get(backend).get()->destroy(rootfs, backendDir));
+          backends.at(backend)->destroy(rootfs, backendDir));
     }
   }
 

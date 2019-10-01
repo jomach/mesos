@@ -17,6 +17,7 @@
 #ifndef __MASTER_ALLOCATOR_MESOS_HIERARCHICAL_HPP__
 #define __MASTER_ALLOCATOR_MESOS_HIERARCHICAL_HPP__
 
+#include <memory>
 #include <set>
 #include <string>
 
@@ -38,8 +39,8 @@
 #include "master/allocator/mesos/allocator.hpp"
 #include "master/allocator/mesos/metrics.hpp"
 
-#include "master/allocator/sorter/drf/sorter.hpp"
-#include "master/allocator/sorter/random/sorter.hpp"
+#include "master/allocator/mesos/sorter/drf/sorter.hpp"
+#include "master/allocator/mesos/sorter/random/sorter.hpp"
 
 #include "master/constants.hpp"
 
@@ -52,17 +53,16 @@ namespace allocator {
 // can typedef an instantiation of it with DRF sorters.
 template <
     typename RoleSorter,
-    typename FrameworkSorter,
-    typename QuotaRoleSorter>
+    typename FrameworkSorter>
 class HierarchicalAllocatorProcess;
 
-typedef HierarchicalAllocatorProcess<DRFSorter, DRFSorter, DRFSorter>
+typedef HierarchicalAllocatorProcess<DRFSorter, DRFSorter>
 HierarchicalDRFAllocatorProcess;
 
 typedef MesosAllocator<HierarchicalDRFAllocatorProcess>
 HierarchicalDRFAllocator;
 
-typedef HierarchicalAllocatorProcess<RandomSorter, RandomSorter, RandomSorter>
+typedef HierarchicalAllocatorProcess<RandomSorter, RandomSorter>
 HierarchicalRandomAllocatorProcess;
 
 typedef MesosAllocator<HierarchicalRandomAllocatorProcess>
@@ -74,6 +74,7 @@ namespace internal {
 // Forward declarations.
 class OfferFilter;
 class InverseOfferFilter;
+class RoleTree;
 
 
 struct Framework
@@ -84,17 +85,21 @@ struct Framework
       bool active,
       bool publishPerFrameworkMetrics);
 
+  const FrameworkID frameworkId;
+
   std::set<std::string> roles;
 
   std::set<std::string> suppressedRoles;
 
   protobuf::framework::Capabilities capabilities;
 
-  // Active offer and inverse offer filters for the framework.
-  // Offer filters are tied to the role the filtered resources
-  // were allocated to.
-  hashmap<std::string, hashmap<SlaveID, hashset<OfferFilter*>>> offerFilters;
-  hashmap<SlaveID, hashset<InverseOfferFilter*>> inverseOfferFilters;
+  // Offer filters are tied to the role the filtered
+  // resources were offered to.
+  hashmap<std::string, hashmap<SlaveID, hashset<std::shared_ptr<OfferFilter>>>>
+    offerFilters;
+
+  hashmap<SlaveID, hashset<std::shared_ptr<InverseOfferFilter>>>
+    inverseOfferFilters;
 
   bool active;
 
@@ -107,6 +112,166 @@ struct Framework
 };
 
 
+class Role
+{
+public:
+  Role(const std::string& name, Role* parent);
+
+  const ResourceQuantities& reservationScalarQuantities() const
+  {
+    return reservationScalarQuantities_;
+  }
+
+  const Resources& offeredOrAllocatedScalars() const
+  {
+    return offeredOrAllocatedScalars_;
+  }
+
+  const hashset<FrameworkID>& frameworks() const { return frameworks_; }
+
+  const Quota& quota() const { return quota_; }
+
+  double weight() const { return weight_; }
+
+  bool isEmpty() const
+  {
+    return children_.empty() &&
+           frameworks_.empty() &&
+           reservationScalarQuantities_.empty() &&
+           quota_ == DEFAULT_QUOTA &&
+           weight_ == DEFAULT_WEIGHT;
+  }
+
+  std::vector<Role*> children() const { return children_.values(); }
+
+  const std::string role; // E.g. "a/b/c"
+  const std::string basename; // E.g. "c"
+
+private:
+  // We keep fields that are related to the tree structure as private
+  // and only allow mutations through the RoleTree structure.
+  friend class RoleTree;
+
+  // Add a child to the role, the child must not already exist.
+  void addChild(Role* child);
+
+  // Remove a child from the role, the child must be present.
+  void removeChild(Role* child);
+
+  Role* parent;
+
+  // Configured guaranteed resource quantities and resource limits for
+  // this role. By default, a role has no guarantee and no limit.
+  Quota quota_;
+
+  // Configured weight for the role. This affects sorting precedence.
+  // By default, weights == DEFAULT_WEIGHT == 1.0.
+  double weight_;
+
+  // IDs of the frameworks tracked under the role, if any.
+  // A framework is tracked under the role if the framework:
+  //
+  // (1) is subscribed to the role;
+  // *OR*
+  // (2) has resources allocated under the role.
+  //
+  // NOTE: (2) could be true without (1). This is because the allocator
+  // interface allows for a framework role to be removed without recovering
+  // resources offered or allocated to this role.
+  hashset<FrameworkID> frameworks_;
+
+  // Total allocated or offered scalar resources to this role, including
+  // meta data. This field dose not affect role's lifecycle. However, since
+  // any offered or allocated resources should be tied to a framework,
+  // an empty role (that has no registered framework) must have
+  // empty offeredOrAllocated resources.
+  Resources offeredOrAllocatedScalars_;
+
+  // Aggregated reserved scalar resource quantities on all agents tied to this
+  // role, if any. This includes both its own reservations as well as
+  // reservations of any of its subroles (i.e. it is hierarchical aware).
+  // Note that non-scalar resources, such as ports, are excluded.
+  ResourceQuantities reservationScalarQuantities_;
+
+  hashmap<std::string, Role*> children_;
+};
+
+
+// A tree abstraction for organizing `class Role` hierarchically.
+//
+// We track a role when it has:
+//
+//   * a non-default weight, or
+//   * a non-default quota, or
+//   * frameworks subscribed to it, or
+//   * reservations, or
+//   * descendent roles meeting any of the above conditions.
+//
+// Any roles that do not meet these conditions are not tracked in the role tree.
+class RoleTree
+{
+public:
+  RoleTree(); // Only used in tests.
+
+  RoleTree(Metrics* metrics);
+
+  ~RoleTree();
+
+  Option<const Role*> get(const std::string& role) const;
+
+  // Return a hashmap of all known roles. Root is not included.
+  const hashmap<std::string, Role>& roles() const { return roles_; }
+
+  const Role* root() const { return root_; }
+
+  // We keep track of reservations to enforce role quota limit
+  // in the presence of unallocated reservations. See MESOS-4527.
+  void trackReservations(const Resources& resources);
+  void untrackReservations(const Resources& resources);
+
+  void trackFramework(
+    const FrameworkID& frameworkId, const std::string& role);
+  void untrackFramework(
+      const FrameworkID& frameworkId, const std::string& role);
+
+  void updateQuota(const std::string& role, const Quota& quota);
+
+  void updateWeight(const std::string& role, double weight);
+
+  void trackOfferedOrAllocated(const Resources& resources);
+  void untrackOfferedOrAllocated(const Resources& resources);
+
+  // Dump the role tree state in JSON format for debugging.
+  std::string toJSON() const;
+
+private:
+  // Private helper to get non-const pointers.
+  Option<Role*> get_(const std::string& role);
+
+  // Lookup or add the role struct associated with the role. Ancestor roles
+  // along the tree path will be created if necessary.
+  Role& operator[](const std::string& role);
+
+  // Try to remove the role associated with the given role.
+  // The role must exist. The role and its ancestors will be removed
+  // if they become "empty". See "Role:isEmpty()".
+  // Return true if the role instance associated with the role is removed.
+  // This should be called whenever a role's state (that defines its emptiness)
+  // gets updated, such as quota, weight, reservation and tracked frameworks.
+  // Otherwise the "tracking only non-empty" tree invariant may break.
+  bool tryRemove(const std::string& role);
+
+  // Root node of the tree, its `basename` == `role` == "".
+  Role* root_;
+
+  // Allocator's metrics handle for publishing role related metrics.
+  Option<Metrics*> metrics;
+
+  // A map of role and `Role` pairs for quick lookup.
+  hashmap<std::string, Role> roles_;
+};
+
+
 class Slave
 {
 public:
@@ -115,12 +280,13 @@ public:
       const protobuf::slave::Capabilities& _capabilities,
       bool _activated,
       const Resources& _total,
-      const Resources& _allocated)
+      const hashmap<FrameworkID, Resources>& _offeredOrAllocated)
     : info(_info),
       capabilities(_capabilities),
       activated(_activated),
       total(_total),
-      allocated(_allocated),
+      offeredOrAllocated(_offeredOrAllocated),
+      totalOfferedOrAllocated(Resources::sum(_offeredOrAllocated)),
       shared(_total.shared()),
       hasGpu_(_total.gpus().getOrElse(0) > 0)
   {
@@ -129,7 +295,15 @@ public:
 
   const Resources& getTotal() const { return total; }
 
-  const Resources& getAllocated() const { return allocated; }
+  const hashmap<FrameworkID, Resources>& getOfferedOrAllocated() const
+  {
+    return offeredOrAllocated;
+  }
+
+  const Resources& getTotalOfferedOrAllocated() const
+  {
+    return totalOfferedOrAllocated;
+  }
 
   const Resources& getAvailable() const { return available; }
 
@@ -143,16 +317,38 @@ public:
     updateAvailable();
   }
 
-  void allocate(const Resources& toAllocate)
+  void increaseAvailable(
+      const FrameworkID& frameworkId, const Resources& offeredOrAllocated_)
   {
-    allocated += toAllocate;
+    // Increasing available is to subtract offered or allocated.
+    if (offeredOrAllocated_.empty()) {
+      return;
+    }
+
+    Resources& resources = offeredOrAllocated.at(frameworkId);
+    CHECK_CONTAINS(resources, offeredOrAllocated_);
+    resources -= offeredOrAllocated_;
+    if (resources.empty()) {
+      offeredOrAllocated.erase(frameworkId);
+    }
+
+    totalOfferedOrAllocated -= offeredOrAllocated_;
 
     updateAvailable();
   }
 
-  void unallocate(const Resources& toUnallocate)
+  void decreaseAvailable(
+      const FrameworkID& frameworkId, const Resources& offeredOrAllocated_)
   {
-    allocated -= toUnallocate;
+    if (offeredOrAllocated_.empty()) {
+      return;
+    }
+
+    // Decreasing available is to add offered or allocated.
+
+    offeredOrAllocated[frameworkId] += offeredOrAllocated_;
+
+    totalOfferedOrAllocated += offeredOrAllocated_;
 
     updateAvailable();
   }
@@ -204,44 +400,42 @@ public:
   Option<Maintenance> maintenance;
 
 private:
-  void updateAvailable() {
+  void updateAvailable()
+  {
     // In order to subtract from the total,
     // we strip the allocation information.
-    Resources allocated_ = allocated;
-    allocated_.unallocate();
+    Resources totalOfferedOrAllocated_ = totalOfferedOrAllocated;
+    totalOfferedOrAllocated_.unallocate();
 
-    // Calling `nonShared()` currently copies the underlying resources
-    // and is therefore rather expensive. We avoid it in the common
-    // case that there are no shared resources.
-    //
-    // TODO(mzhu): Ideally there would be a single logical path here.
-    // One solution is to have `Resources` be copy-on-write such that
-    // `nonShared()` performs no copying and instead points to a
-    // subset of the original `Resource` objects.
+    // This is hot path. We avoid the unnecessary resource traversals
+    // in the common case where there are no shared resources.
     if (shared.empty()) {
-      available = total - allocated_;
+      available = total - totalOfferedOrAllocated_;
     } else {
       // Since shared resources are offerable even when they are in use, we
       // always include them as part of available resources.
-      available = (total.nonShared() - allocated_.nonShared()) + shared;
+      available =
+        (total.nonShared() - totalOfferedOrAllocated_.nonShared()) + shared;
     }
   }
 
   // Total amount of regular *and* oversubscribed resources.
   Resources total;
 
-  // Regular *and* oversubscribed resources that are allocated.
-  //
-  // NOTE: We maintain multiple copies of each shared resource allocated
-  // to a slave, where the number of copies represents the number of times
-  // this shared resource has been allocated to (and has not been recovered
-  // from) a specific framework.
-  //
   // NOTE: We keep track of the slave's allocated resources despite
   // having that information in sorters. This is because the
   // information in sorters is not accurate if some framework
   // hasn't reregistered. See MESOS-2919 for details.
-  Resources allocated;
+  //
+  // This includes both regular *and* oversubscribed resources.
+  //
+  // An entry is erased if a framework no longer has any
+  // offered or allocated on the agent.
+  hashmap<FrameworkID, Resources> offeredOrAllocated;
+
+  // Sum of all offered or allocated resources on the agent. This should equal
+  // to sum of `offeredOrAllocated` (including all the meta-data).
+  Resources totalOfferedOrAllocated;
 
   // We track the total and allocated resources on the slave to
   // avoid calculating it in place every time.
@@ -272,14 +466,13 @@ class HierarchicalAllocatorProcess : public MesosAllocatorProcess
 public:
   HierarchicalAllocatorProcess(
       const std::function<Sorter*()>& roleSorterFactory,
-      const std::function<Sorter*()>& _frameworkSorterFactory,
-      const std::function<Sorter*()>& quotaRoleSorterFactory)
+      const std::function<Sorter*()>& _frameworkSorterFactory)
     : initialized(false),
       paused(true),
       metrics(*this),
       completedFrameworkMetrics(0),
+      roleTree(&metrics),
       roleSorter(roleSorterFactory()),
-      quotaRoleSorter(quotaRoleSorterFactory()),
       frameworkSorterFactory(_frameworkSorterFactory) {}
 
   ~HierarchicalAllocatorProcess() override {}
@@ -401,12 +594,9 @@ public:
       const FrameworkID& frameworkId,
       const std::set<std::string>& roles) override;
 
-  void setQuota(
+  void updateQuota(
       const std::string& role,
       const Quota& quota) override;
-
-  void removeQuota(
-      const std::string& role) override;
 
   void updateWeights(
       const std::vector<WeightInfo>& weightInfos) override;
@@ -420,43 +610,40 @@ protected:
   typedef HierarchicalAllocatorProcess Self;
   typedef HierarchicalAllocatorProcess This;
 
-  // Allocate any allocatable resources from all known agents.
-  process::Future<Nothing> allocate();
+  // Generate offers from all known agents.
+  process::Future<Nothing> generateOffers();
 
-  // Allocate resources from the specified agent.
-  process::Future<Nothing> allocate(const SlaveID& slaveId);
+  // Generate offers from the specified agent.
+  process::Future<Nothing> generateOffers(const SlaveID& slaveId);
 
-  // Allocate resources from the specified agents. The allocation
-  // is deferred and batched with other allocation requests.
-  process::Future<Nothing> allocate(const hashset<SlaveID>& slaveIds);
+  // Generate offers from the specified agents. The offer generation is
+  // deferred and batched with other offer generation requests.
+  process::Future<Nothing> generateOffers(const hashset<SlaveID>& slaveIds);
 
-  // Method that performs allocation work.
-  Nothing _allocate();
+  Nothing _generateOffers();
 
-  // Helper for `_allocate()` that allocates resources for offers.
-  void __allocate();
+  void __generateOffers();
 
-  // Helper for `_allocate()` that deallocates resources for inverse offers.
-  void deallocate();
+  void generateInverseOffers();
 
   // Remove an offer filter for the specified role of the framework.
   void expire(
       const FrameworkID& frameworkId,
       const std::string& role,
       const SlaveID& slaveId,
-      OfferFilter* offerFilter);
+      const std::weak_ptr<OfferFilter>& offerFilter);
 
   void _expire(
       const FrameworkID& frameworkId,
       const std::string& role,
       const SlaveID& slaveId,
-      OfferFilter* offerFilter);
+      const std::weak_ptr<OfferFilter>& offerFilter);
 
   // Remove an inverse offer filter for the specified framework.
   void expire(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
-      InverseOfferFilter* inverseOfferFilter);
+      const std::weak_ptr<InverseOfferFilter>& inverseOfferFilter);
 
   // Checks whether the slave is whitelisted.
   bool isWhitelisted(const SlaveID& slaveId) const;
@@ -464,16 +651,16 @@ protected:
   // Returns true if there is a resource offer filter for the
   // specified role of this framework on this slave.
   bool isFiltered(
-      const FrameworkID& frameworkId,
+      const Framework& framework,
       const std::string& role,
-      const SlaveID& slaveId,
+      const Slave& slave,
       const Resources& resources) const;
 
   // Returns true if there is an inverse offer filter for this framework
   // on this slave.
   bool isFiltered(
-      const FrameworkID& frameworkID,
-      const SlaveID& slaveID) const;
+      const Framework& framework,
+      const Slave& slave) const;
 
   bool allocatable(
       const Resources& resources,
@@ -512,7 +699,7 @@ protected:
   double _resources_offered_or_allocated(
       const std::string& resource);
 
-  double _quota_allocated(
+  double _quota_offered_or_allocated(
       const std::string& role,
       const std::string& resource);
 
@@ -526,60 +713,38 @@ protected:
 
   hashmap<SlaveID, Slave> slaves;
 
+  RoleTree roleTree;
+
   // A set of agents that are kept as allocation candidates. Events
-  // may add or remove candidates to the set. When an allocation is
+  // may add or remove candidates to the set. When an offer generation is
   // processed, the set of candidates is cleared.
   hashset<SlaveID> allocationCandidates;
 
-  // Future for the dispatched allocation that becomes
-  // ready after the allocation run is complete.
-  Option<process::Future<Nothing>> allocation;
-
-  // We track information about roles that we're aware of in the system.
-  // Specifically, we keep track of the roles when a framework subscribes to
-  // the role, and/or when there are resources allocated to the role
-  // (e.g. some tasks and/or executors are consuming resources under the role).
-  //
-  // NOTE: There is currently not a role entry when there is a
-  // reservation but no allocation / framework!
-  //
-  // TODO(bmahler): Turn this into a `hashmap<string, Role>` that
-  // also tracks a role if it has reservations.
-  hashmap<std::string, hashset<FrameworkID>> roles;
-
-  // Configured guaranteed resource quantities for each role, if any.
-  // If a role does not have an entry here it has (the default)
-  // no guarantee.
-  hashmap<std::string, ResourceQuantities> quotaGuarantees;
-
-  // Aggregated resource reservations on all agents tied to a
-  // particular role, if any.
-  //
-  // Only roles with non-empty scalar reservation quantities will
-  // be stored in the map.
-  hashmap<std::string, ResourceQuantities> reservationScalarQuantities;
+  // Future for the dispatched offer generation that becomes
+  // ready after the offer generation run is complete.
+  Option<process::Future<Nothing>> offerGeneration;
 
   // Slaves to send offers for.
   Option<hashset<std::string>> whitelist;
 
-  // There are two stages of allocation:
+  // There are two stages of offer generation:
   //
-  //   Stage 1: Allocate to satisfy quota guarantees.
+  //   Stage 1: Generate offers to satisfy quota guarantees.
   //
-  //   Stage 2: Allocate above quota guarantees up to quota limits.
+  //   Stage 2: Generate offers above quota guarantees up to quota limits.
   //            Note that we need to hold back enough "headroom"
   //            to ensure that any unsatisfied quota can be
   //            satisfied later.
   //
   // Each stage comprises two levels of sorting, hence "hierarchical".
   // Level 1 sorts across roles:
-  //   Currently, only the allocated portion of the reserved resources are
-  //   accounted for fairness calculation.
+  //   Currently, only the offered or allocated portion of the reserved
+  //   resources are accounted for fairness calculation.
   //
   // TODO(mpark): Reserved resources should be accounted for fairness
-  // calculation whether they are allocated or not, since they model a long or
-  // forever running task. That is, the effect of reserving resources is
-  // equivalent to launching a task in that the resources that make up the
+  // calculation whether they are offered/allocated or not, since they model
+  // a long or forever running task. That is, the effect of reserving resources
+  // is equivalent to launching a task in that the resources that make up the
   // reservation are not available to other roles as non-revocable.
   //
   // Level 2 sorts across frameworks within a particular role:
@@ -598,34 +763,15 @@ protected:
   // revocable resources.
 
   // A sorter for active roles. This sorter determines the order in which
-  // roles are allocated resources during Level 1 of the second stage.
+  // roles are offered resources during Level 1 of the second stage.
   // The total cluster resources are used as the resource pool.
   process::Owned<Sorter> roleSorter;
 
-  // TODO(bmahler): Remove this in favor of either using the same sorting
-  // between satisfying guarantees and bursting above guarantees up to
-  // limits, or have a different sorting technique specifically for
-  // satisfying guarantees (e.g. MESOS-8026). This is tech debt from
-  // when a "quota role" was considered different from a "non-quota"
-  // role. However, they are the same, one just has a default quota.
-  //
-  // A dedicated sorter for roles that have a non-default quota.
-  // This sorter determines the order in which guarantees are allocated
-  // during Level 1 of the first stage. Since only non-revocable
-  // resources are available for quota, the total cluster non-revocable
-  // resources are used as the resource pool.
-  //
-  // NOTE: A role appears in `quotaRoleSorter` if it has a non-default
-  // quota (even if no frameworks are currently registered in that role).
-  // In contrast, `roleSorter` only contains entries for roles with one
-  // or more registered frameworks.
-  process::Owned<Sorter> quotaRoleSorter;
-
   // A collection of sorters, one per active role. Each sorter determines
-  // the order in which frameworks that belong to the same role are allocated
+  // the order in which frameworks that belong to the same role are offered
   // resources inside the role's share. These sorters are used during Level 2
   // for both the first and the second stages. Since frameworks are sharing
-  // the resources allocated to a role, the role's allocation is used as
+  // resources of a role, resources offered or allocated to the role are used as
   // the resource pool for each role specific framework sorter.
   hashmap<std::string, process::Owned<Sorter>> frameworkSorters;
 
@@ -637,33 +783,27 @@ private:
       const FrameworkID& frameworkId,
       const std::string& role) const;
 
+  Option<Slave*> getSlave(const SlaveID& slaveId) const;
+  Option<Framework*> getFramework(const FrameworkID& frameworkId) const;
+
+  Option<Sorter*> getFrameworkSorter(const std::string& role) const;
+
+  const Quota& getQuota(const std::string& role) const;
+
+  // Helpers to track and untrack a framework under a role.
+  // Frameworks should be tracked under a role either if it subscribes to the
+  // role *OR* it has resources allocated/offered to that role. when neither
+  // conditions are met, it should be untracked.
+  //
+  // `tryUntrackFrameworkUnderRole` returns true if the framework is untracked
+  // under the role.
   void trackFrameworkUnderRole(
-      const FrameworkID& frameworkId,
-      const std::string& role);
+      const Framework& framework, const std::string& role);
+  bool tryUntrackFrameworkUnderRole(
+      const Framework& framework, const std::string& role);
 
-  void untrackFrameworkUnderRole(
-      const FrameworkID& frameworkId,
-      const std::string& role);
-
-  // `trackReservations` and `untrackReservations` are helpers
-  // to track role resource reservations. We need to keep
-  // track of reservations to enforce role quota limit
-  // in the presence of unallocated reservations. See MESOS-4527.
-  //
-  // TODO(mzhu): Ideally, we want these helpers to instead track the
-  // reservations as *allocated* in the sorters even when the
-  // reservations have not been allocated yet. This will help to:
-  //
-  //   (1) Solve the fairness issue when roles with unallocated
-  //       reservations may game the allocator (See MESOS-8299).
-  //
-  //   (2) Simplify the quota enforcement logic -- the allocator
-  //       would no longer need to track reservations separately.
-  void trackReservations(
-      const hashmap<std::string, Resources>& reservations);
-
-  void untrackReservations(
-      const hashmap<std::string, Resources>& reservations);
+  void suppressRoles(Framework& framework, const std::set<std::string>& roles);
+  void reviveRoles(Framework& framework, const std::set<std::string>& roles);
 
   // Helper to update the agent's total resources maintained in the allocator
   // and the role and quota sorters (whose total resources match the agent's
@@ -693,17 +833,25 @@ private:
       const Resources& resources,
       const protobuf::framework::Capabilities& frameworkCapabilities) const;
 
-  // Helper to track allocated resources on an agent.
+  // Helper to track offered or allocated resources on an agent.
+  //
+  // TODO(asekretenko): rename `(un)trackAllocatedResources()` to reflect the
+  // fact that these methods do not distinguish between offered and allocated.
+  //
+  // TODO(mzhu): replace this with `RoleTree::trackOfferedOrAllocated`.
   void trackAllocatedResources(
       const SlaveID& slaveId,
       const FrameworkID& frameworkId,
-      const Resources& allocated);
+      const Resources& offeredOrAllocated);
 
-  // Helper to untrack resources that are no longer allocated on an agent.
+  // Helper to untrack resources that are no longer offered or allocated
+  // on an agent.
+  //
+  // TODO(mzhu): replace this with `RoleTree::untrackOfferedOrAllocated`.
   void untrackAllocatedResources(
       const SlaveID& slaveId,
       const FrameworkID& frameworkId,
-      const Resources& allocated);
+      const Resources& offeredOrallocated);
 
   // Helper that removes all existing offer filters for the given slave
   // id.
@@ -719,8 +867,7 @@ private:
 // to keep the implementation of the allocator in the implementation file.
 template <
     typename RoleSorter,
-    typename FrameworkSorter,
-    typename QuotaRoleSorter>
+    typename FrameworkSorter>
 class HierarchicalAllocatorProcess
   : public internal::HierarchicalAllocatorProcess
 {
@@ -731,8 +878,7 @@ public:
           [this]() -> Sorter* {
             return new RoleSorter(this->self(), "allocator/mesos/roles/");
           },
-          []() -> Sorter* { return new FrameworkSorter(); },
-          []() -> Sorter* { return new QuotaRoleSorter(); }) {}
+          []() -> Sorter* { return new FrameworkSorter(); }) {}
 };
 
 } // namespace allocator {

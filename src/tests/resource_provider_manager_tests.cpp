@@ -46,6 +46,7 @@
 #include <stout/recordio.hpp>
 #include <stout/result.hpp>
 #include <stout/stringify.hpp>
+#include <stout/strings.hpp>
 #include <stout/try.hpp>
 
 #include "common/http.hpp"
@@ -195,6 +196,69 @@ TEST_P(ResourceProviderManagerHttpApiTest, MalformedContent)
     case ContentType::RECORDIO:
       break;
   }
+}
+
+
+// Confirm that the resource provider manager performs call validation
+// taking into account the resource provider info of the caller. The
+// validation is tested in detail in `resource_provider_validation_tests.cpp`.
+TEST_F(ResourceProviderManagerHttpApiTest, CallProviderValidation)
+{
+  Clock::pause();
+
+  // Start master and agent.
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(agent);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+  AWAIT_READY(updateSlaveMessage);
+
+  mesos::v1::ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.set_type("org.apache.mesos.rp.test");
+  resourceProviderInfo.set_name("test");
+
+  v1::TestResourceProvider resourceProvider(resourceProviderInfo);
+
+  // Start and register a resource provider.
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(agent.get()->pid));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*resourceProvider.process, subscribed(_))
+    .WillOnce(FutureArg<0>(&subscribed));
+
+  resourceProvider.start(std::move(endpointDetector), ContentType::PROTOBUF);
+
+  AWAIT_READY(subscribed);
+
+  Call call;
+  call.set_type(Call::UPDATE_STATE);
+  call.mutable_resource_provider_id()->CopyFrom(subscribed->provider_id());
+
+  Call::UpdateState* updateState = call.mutable_update_state();
+  updateState->mutable_resource_version_uuid()->set_value(
+      id::UUID::random().toBytes());
+
+  // Add a single resource with unset `provider_id`. This will be
+  // caught by call validation in the resource provider manager.
+  v1::Resource* resource = updateState->add_resources();
+  resource->CopyFrom(*v1::Resources::parse("disk", "32", "*"));
+
+  Future<Nothing> send = resourceProvider.send(call);
+  AWAIT_FAILED(send);
+  EXPECT_TRUE(strings::contains(send.failure(), BadRequest().status))
+    << send.failure();
 }
 
 
@@ -1015,7 +1079,7 @@ TEST_P(ResourceProviderManagerHttpApiTest, ConvertResources)
   resourceProviderInfo.set_type("org.apache.mesos.rp.test");
   resourceProviderInfo.set_name("test");
 
-  v1::MockResourceProvider resourceProvider(
+  v1::TestResourceProvider resourceProvider(
       resourceProviderInfo, Some(v1::Resources(disk)));
 
   // Start and register a resource provider.
@@ -1148,8 +1212,8 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   v1::Resource disk = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw());
 
-  Owned<v1::MockResourceProvider> resourceProvider(
-      new v1::MockResourceProvider(resourceProviderInfo, v1::Resources(disk)));
+  Owned<v1::TestResourceProvider> resourceProvider(
+      new v1::TestResourceProvider(resourceProviderInfo, v1::Resources(disk)));
 
   // Start and register a resource provider.
   Owned<EndpointDetector> endpointDetector(
@@ -1164,17 +1228,20 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   // will have an ID assigned by the agent.
   AWAIT_READY(updateSlaveMessage);
 
-  ASSERT_TRUE(resourceProvider->info.has_id());
+  Future<v1::ResourceProviderID> resourceProviderId =
+    resourceProvider->process->id();
 
-  resourceProviderInfo = resourceProvider->info;
+  AWAIT_READY(resourceProviderId);
+
+  resourceProviderInfo.mutable_id()->CopyFrom(resourceProviderId.get());
 
   // Resource provider failover by opening a new connection.
   // The assigned resource provider ID will be used to resubscribe.
   resourceProvider.reset(
-      new v1::MockResourceProvider(resourceProviderInfo, v1::Resources(disk)));
+      new v1::TestResourceProvider(resourceProviderInfo, v1::Resources(disk)));
 
   Future<Event::Subscribed> subscribed1;
-  EXPECT_CALL(*resourceProvider, subscribed(_))
+  EXPECT_CALL(*resourceProvider->process, subscribed(_))
     .WillOnce(FutureArg<0>(&subscribed1));
 
   endpointDetector =
@@ -1189,12 +1256,16 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   // We terminate the resource provider once we have confirmed that it
   // got disconnected. This avoids it to in turn resubscribe racing
   // with the newly created resource provider.
+  auto resourceProviderProcess = resourceProvider->process->self();
   Future<Nothing> disconnected;
-  EXPECT_CALL(*resourceProvider, disconnected())
+  EXPECT_CALL(*resourceProvider->process, disconnected())
     .WillOnce(DoAll(
-        Invoke([&resourceProvider]() { resourceProvider.reset(); }),
+        Invoke([resourceProviderProcess]() {
+          dispatch(
+              resourceProviderProcess, &v1::TestResourceProviderProcess::stop);
+        }),
         FutureSatisfy(&disconnected)))
-    .WillRepeatedly(Return()); // Ignore spurious calls concurrent with `reset`.
+    .WillRepeatedly(Return()); // Ignore spurious calls concurrent with `stop`.
 
   // The agent failover.
   agent->reset();
@@ -1211,12 +1282,12 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   endpointDetector =
     resource_provider::createEndpointDetector(agent.get()->pid);
 
-  resourceProvider.reset(new v1::MockResourceProvider(
+  resourceProvider.reset(new v1::TestResourceProvider(
       resourceProviderInfo,
       Some(v1::Resources(disk))));
 
   Future<Event::Subscribed> subscribed2;
-  EXPECT_CALL(*resourceProvider, subscribed(_))
+  EXPECT_CALL(*resourceProvider->process, subscribed(_))
     .WillOnce(FutureArg<0>(&subscribed2));
 
   resourceProvider->start(std::move(endpointDetector), contentType);
@@ -1261,15 +1332,18 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeUnknownID)
   resourceProviderInfo.set_type("org.apache.mesos.rp.test");
   resourceProviderInfo.set_name("test");
 
-  Owned<v1::MockResourceProvider> resourceProvider(
-      new v1::MockResourceProvider(resourceProviderInfo));
+  v1::TestResourceProvider resourceProvider(resourceProviderInfo);
 
-  // We explicitly reset the resource provider after the expected
+  // We explicitly terminate the resource provider after the expected
   // disconnect to prevent it from resubscribing indefinitely.
+  auto resourceProviderProcess = resourceProvider.process->self();
   Future<Nothing> disconnected;
-  EXPECT_CALL(*resourceProvider, disconnected())
+  EXPECT_CALL(*resourceProvider.process, disconnected())
     .WillOnce(DoAll(
-        Invoke([&resourceProvider]() { resourceProvider.reset(); }),
+        Invoke([resourceProviderProcess]() {
+          dispatch(
+              resourceProviderProcess, &v1::TestResourceProviderProcess::stop);
+        }),
         FutureSatisfy(&disconnected)));
 
   // Start and register a resource provider.
@@ -1278,7 +1352,7 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResubscribeUnknownID)
 
   const ContentType contentType = GetParam();
 
-  resourceProvider->start(std::move(endpointDetector), contentType);
+  resourceProvider.start(std::move(endpointDetector), contentType);
 
   AWAIT_READY(disconnected);
 }
@@ -1320,8 +1394,8 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResourceProviderDisconnect)
   v1::Resource disk = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw());
 
-  Owned<v1::MockResourceProvider> resourceProvider(
-      new v1::MockResourceProvider(
+  Owned<v1::TestResourceProvider> resourceProvider(
+      new v1::TestResourceProvider(
           resourceProviderInfo,
           v1::Resources(disk)));
 
@@ -1339,8 +1413,12 @@ TEST_P(ResourceProviderManagerHttpApiTest, ResourceProviderDisconnect)
     // provider will have an ID assigned by the agent.
     AWAIT_READY(updateSlaveMessage);
 
-    ASSERT_TRUE(resourceProvider->info.has_id());
-    disk.mutable_provider_id()->CopyFrom(resourceProvider->info.id());
+    Future<v1::ResourceProviderID> resourceProviderId =
+      resourceProvider->process->id();
+
+    AWAIT_READY(resourceProviderId);
+
+    disk.mutable_provider_id()->CopyFrom(resourceProviderId.get());
 
     const Resources& totalResources =
       updateSlaveMessage->resource_providers().providers(0).total_resources();
@@ -1389,18 +1467,17 @@ TEST_F(ResourceProviderManagerHttpApiTest, ResourceProviderSubscribeDisconnect)
   resourceProviderInfo.set_type("org.apache.mesos.rp.test");
   resourceProviderInfo.set_name("test");
 
-  Owned<v1::MockResourceProvider> resourceProvider1(
-      new v1::MockResourceProvider(resourceProviderInfo));
+  v1::TestResourceProvider resourceProvider1(resourceProviderInfo);
 
   // Start and register a resource provider.
   Owned<EndpointDetector> endpointDetector(
       resource_provider::createEndpointDetector(agent.get()->pid));
 
   Future<Event::Subscribed> subscribed1;
-  EXPECT_CALL(*resourceProvider1, subscribed(_))
+  EXPECT_CALL(*resourceProvider1.process, subscribed(_))
     .WillOnce(FutureArg<0>(&subscribed1));
 
-  resourceProvider1->start(std::move(endpointDetector), ContentType::PROTOBUF);
+  resourceProvider1.start(std::move(endpointDetector), ContentType::PROTOBUF);
 
   AWAIT_READY(subscribed1);
 
@@ -1409,21 +1486,26 @@ TEST_F(ResourceProviderManagerHttpApiTest, ResourceProviderSubscribeDisconnect)
   // Subscribing a second resource provider with the same ID will
   // disconnect the first instance and handle the subscription by the
   // second resource provider as a resubscription.
-  Owned<v1::MockResourceProvider> resourceProvider2(
-      new v1::MockResourceProvider(resourceProviderInfo));
+  Owned<v1::TestResourceProvider> resourceProvider2(
+      new v1::TestResourceProvider(resourceProviderInfo));
 
   // We terminate the first resource provider once we have confirmed
   // that it got disconnected. This avoids it to in turn resubscribe
   // racing with the other resource provider.
+  auto resourceProviderProcess1 = resourceProvider1.process->self();
   Future<Nothing> disconnected1;
-  EXPECT_CALL(*resourceProvider1, disconnected())
+  EXPECT_CALL(*resourceProvider1.process, disconnected())
     .WillOnce(DoAll(
-        Invoke([&resourceProvider1]() { resourceProvider1.reset(); }),
+        Invoke([resourceProviderProcess1]() {
+          dispatch(
+              resourceProviderProcess1,
+              &v1::TestResourceProviderProcess::stop);
+        }),
         FutureSatisfy(&disconnected1)))
-    .WillRepeatedly(Return()); // Ignore spurious calls concurrent with `reset`.
+    .WillRepeatedly(Return()); // Ignore spurious calls concurrent with `stop`.
 
   Future<Event::Subscribed> subscribed2;
-  EXPECT_CALL(*resourceProvider2, subscribed(_))
+  EXPECT_CALL(*resourceProvider2->process, subscribed(_))
     .WillOnce(FutureArg<0>(&subscribed2));
 
   endpointDetector =
@@ -1477,15 +1559,15 @@ TEST_F(ResourceProviderManagerHttpApiTest, Metrics)
   resourceProviderInfo.set_type("org.apache.mesos.rp.test");
   resourceProviderInfo.set_name("test");
 
-  Owned<v1::MockResourceProvider> resourceProvider(
-      new v1::MockResourceProvider(resourceProviderInfo));
+  Owned<v1::TestResourceProvider> resourceProvider(
+      new v1::TestResourceProvider(resourceProviderInfo));
 
   // Start and register a resource provider.
   Owned<EndpointDetector> endpointDetector(
       resource_provider::createEndpointDetector(agent.get()->pid));
 
   Future<Event::Subscribed> subscribed;
-  EXPECT_CALL(*resourceProvider, subscribed(_))
+  EXPECT_CALL(*resourceProvider->process, subscribed(_))
     .WillOnce(FutureArg<0>(&subscribed));
 
   resourceProvider->start(std::move(endpointDetector), ContentType::PROTOBUF);

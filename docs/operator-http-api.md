@@ -1661,6 +1661,93 @@ Content-Type: application/json
 
 ```
 
+### GET_OPERATIONS
+
+Returns a list of all offer operations throughout the cluster, not including
+`LAUNCH` or `LAUNCH_GROUP` operations which can be retrieved with `GET_TASKS`.
+
+```
+GET_OPERATIONS HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "GET_OPERATIONS"
+}
+
+
+GET_OPERATIONS HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+
+Content-Type: application/json
+
+{
+  "type": "GET_OPERATIONS",
+  "get_operations": {
+    "operations": [
+      {
+        "framework_id": {"value": "74bddcbc-4a02-4d64-b291-aed52032055f-0000"},
+        "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+        "info": {
+          "type": "CREATE_DISK",
+          "id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "create_disk": {
+            "source": {
+              "provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"},
+              "name": "disk",
+              "type": "SCALAR",
+              "scalar": {"value": 1024.0},
+              "role": "storage-role-1",
+              "allocation_info": {"role": "storage-role-1"},
+              "reservation": {
+                "type": "DYNAMIC",
+                "role": "storage-role-1",
+                "principal": "storage-service"
+              },
+              "reservations": [{
+                "type": "DYNAMIC",
+                "role": "storage-role-1",
+                "principal": "storage-service"
+              }],
+              "disk": {
+                "source": {
+                  "type": "RAW",
+                  "vendor": "nas-service",
+                  "id": "vol-19827509",
+                  "profile": "fast-volume"
+                }
+              }
+            },
+            "target_type": "MOUNT"
+          }
+        },
+        "latest_status": {
+          "operation_id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "state": "OPERATION_PENDING",
+          "uuid": {"value": "28987843-j288-1k0s-l29n-837ybzmo18tj-nv73"},
+          "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+          "resource_provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"}
+        },
+        "statuses": [{
+          "operation_id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "state": "OPERATION_PENDING",
+          "uuid": {"value": "28987843-j288-1k0s-l29n-837ybzmo18tj-nv73"},
+          "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+          "resource_provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"}
+        }],
+        "uuid": {"value": "nsj27802-jd82-jd19-jd38-837jdfnoqfij-u284"}
+      }
+    ]
+  }
+}
+
+```
+
 ### GET_WEIGHTS
 
 This call retrieves the information about role weights.
@@ -2336,26 +2423,16 @@ Content-Type: application/json
     "status": {
       "infos": [
         {
-          "guarantee": [
+          "configs" : [
             {
-              "name": "cpus",
-              "role": "*",
-              "scalar": {
-                "value": 1.0
-              },
-              "type": "SCALAR"
-            },
-            {
-              "name": "mem",
-              "role": "*",
-              "scalar": {
-                "value": 512.0
-              },
-              "type": "SCALAR"
+              "role": "dev",
+              "limits": {
+                "cpus": { "value": 2.0 },
+                "mem":  { "value": 2048.0 },
+                "disk": { "value": 4096.0 }
+              }
             }
-          ],
-          "principal": "my-principal",
-          "role": "role1"
+          ]
         }
       ]
     }
@@ -2364,12 +2441,15 @@ Content-Type: application/json
 
 ```
 
-### SET_QUOTA
+### UPDATE_QUOTA
 
-This call sets the quota for resources to be used by a particular role.
+This call updates the quota for the specified role(s).
+These configurations are applied in an all-or-nothing manner.
+To reset a role's quota back to the default (no guarantees and no limits),
+simply update its quota with empty guarantees and limits fields.
 
 ```
-SET_QUOTA HTTP Request (JSON):
+UPDATE_QUOTA HTTP Request (JSON):
 
 POST /api/v1  HTTP/1.1
 
@@ -2378,64 +2458,33 @@ Content-Type: application/json
 Accept: application/json
 
 {
-  "type": "SET_QUOTA",
-  "set_quota": {
-    "quota_request": {
-      "force": true,
-      "guarantee": [
-        {
-          "name": "cpus",
-          "role": "*",
-          "scalar": {
-            "value": 1.0
-          },
-          "type": "SCALAR"
-        },
-        {
-          "name": "mem",
-          "role": "*",
-          "scalar": {
-            "value": 512.0
-          },
-          "type": "SCALAR"
+  "type": "UPDATE_QUOTA",
+  "update_quota": {
+    "force": false,
+    "quota_configs": [
+      {
+        "role": "dev",
+        "limits": {
+          "cpus": { "value": 10 },
+          "mem":  { "value": 2048 },
+          "disk": { "value": 4096 }
         }
-      ],
-      "role": "role1"
-    }
+      },
+      {
+        "role": "test",
+        "limits": {
+          "cpus": { "value": 1 },
+          "mem":  { "value": 256 },
+          "disk": { "value": 512 }
+        }
+      }
+    ]
   }
 }
 
+UPDATE_QUOTA HTTP Response:
 
-SET_QUOTA HTTP Response:
-
-HTTP/1.1 202 Accepted
-
-```
-
-### REMOVE_QUOTA
-
-This call removes the quota for a particular role.
-
-```
-REMOVE_QUOTA HTTP Request (JSON):
-
-POST /api/v1  HTTP/1.1
-
-Host: masterhost:5050
-Content-Type: application/json
-Accept: application/json
-
-{
-  "type": "REMOVE_QUOTA",
-  "remove_quota": {
-    "role": "role1"
-  }
-}
-
-
-REMOVE_QUOTA HTTP Response:
-
-HTTP/1.1 202 Accepted
+HTTP/1.1 200 OK
 
 ```
 
@@ -2470,6 +2519,91 @@ Accept: application/json
 }
 
 MARK_AGENT_GONE HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+```
+
+### DRAIN_AGENT
+
+Initiates [draining](maintenance.md) on the specified agent.
+
+```
+DRAIN_AGENT HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "DRAIN_AGENT",
+  "drain_agent": {
+    "agent_id": {
+      "value": "3192b9d1-db71-4699-ae25-e28dfbf42de1"
+    },
+    "max_grace_period": "10mins",
+    "mark_gone": false
+  }
+}
+
+DRAIN_AGENT HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+```
+
+### DEACTIVATE_AGENT
+
+Deactivates the specified agent, preventing offers for that agent's resources
+from being sent to schedulers until the agent is reactivated.
+
+```
+DEACTIVATE_AGENT HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "DEACTIVATE_AGENT",
+  "deactivate_agent": {
+    "agent_id": {
+      "value": "3192b9d1-db71-4699-ae25-e28dfbf42de1"
+    }
+  }
+}
+
+DEACTIVATE_AGENT HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+```
+
+### REACTIVATE_AGENT
+
+Reactivates the specified agent, resuming offers for that agent's resources if
+the agent was previously deactivated.
+
+```
+REACTIVATE_AGENT HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: masterhost:5050
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "REACTIVATE_AGENT",
+  "reactivate_agent": {
+    "agent_id": {
+      "value": "3192b9d1-db71-4699-ae25-e28dfbf42de1"
+    }
+  }
+}
+
+REACTIVATE_AGENT HTTP Response (JSON):
 
 HTTP/1.1 200 OK
 ```
@@ -3590,6 +3724,93 @@ Content-Type: application/json
 
 ```
 
+### GET_OPERATIONS
+
+Returns a list of all offer operations known to the agent, not including
+`LAUNCH` or `LAUNCH_GROUP` operations which can be retrieved with `GET_TASKS`.
+
+```
+GET_OPERATIONS HTTP Request (JSON):
+
+POST /api/v1  HTTP/1.1
+
+Host: agenthost:5051
+Content-Type: application/json
+Accept: application/json
+
+{
+  "type": "GET_OPERATIONS"
+}
+
+
+GET_OPERATIONS HTTP Response (JSON):
+
+HTTP/1.1 200 OK
+
+Content-Type: application/json
+
+{
+  "type": "GET_OPERATIONS",
+  "get_operations": {
+    "operations": [
+      {
+        "framework_id": {"value": "74bddcbc-4a02-4d64-b291-aed52032055f-0000"},
+        "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+        "info": {
+          "type": "CREATE_DISK",
+          "id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "create_disk": {
+            "source": {
+              "provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"},
+              "name": "disk",
+              "type": "SCALAR",
+              "scalar": {"value": 1024.0},
+              "role": "storage-role-1",
+              "allocation_info": {"role": "storage-role-1"},
+              "reservation": {
+                "type": "DYNAMIC",
+                "role": "storage-role-1",
+                "principal": "storage-service"
+              },
+              "reservations": [{
+                "type": "DYNAMIC",
+                "role": "storage-role-1",
+                "principal": "storage-service"
+              }],
+              "disk": {
+                "source": {
+                  "type": "RAW",
+                  "vendor": "nas-service",
+                  "id": "vol-19827509",
+                  "profile": "fast-volume"
+                }
+              }
+            },
+            "target_type": "MOUNT"
+          }
+        },
+        "latest_status": {
+          "operation_id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "state": "OPERATION_PENDING",
+          "uuid": {"value": "28987843-j288-1k0s-l29n-837ybzmo18tj-nv73"},
+          "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+          "resource_provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"}
+        },
+        "statuses": [{
+          "operation_id": {"value": "n2j8nksj-9827-82bk-nd7u-83hbchu7whdk-9978"},
+          "state": "OPERATION_PENDING",
+          "uuid": {"value": "28987843-j288-1k0s-l29n-837ybzmo18tj-nv73"},
+          "agent_id": {"value": "18083noa-j287-dan4-9qx6-l02b84nksb7z-0021"},
+          "resource_provider_id": {"value": "837hfmi2-u2u7-19pp-1884-812i8f02828j-0030"}
+        }],
+        "uuid": {"value": "nsj27802-jd82-jd19-jd38-837jdfnoqfij-u284"}
+      }
+    ]
+  }
+}
+
+```
+
 ### LAUNCH_NESTED_CONTAINER
 
 This call launches a nested container. Any authorized entity,
@@ -3816,7 +4037,9 @@ they may contain subtypes of either DATA or CONTROL. DATA messages
 must be of type STDIN and contain the actual data to stream to the
 STDIN of the container being attached to. Currently, the only valid
 CONTROL message sends a heartbeat to keep the connection alive. We may
-add more CONTROL messages in the future.
+add more CONTROL messages in the future. An empty DATA message of type
+STDIN indicates EOF. If the container was launched with TTYInfo in their
+ContainerInfo, an EOT DATA message is expected instead.
 
 ```
 ATTACH_CONTAINER_INPUT HTTP Request (JSON):
@@ -3865,6 +4088,19 @@ Accept: application/json
             "nanoseconds": 30000000000
           }
         }
+      }
+    }
+  }
+}215
+{
+  "type": "ATTACH_CONTAINER_INPUT",
+  "attach_container_input": {
+    "type": "PROCESS_IO",
+    "process_io": {
+      "type": "DATA",
+      "data": {
+        "type": "STDIN",
+        "data": ""
       }
     }
   }

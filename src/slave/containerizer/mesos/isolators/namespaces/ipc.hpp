@@ -39,8 +39,13 @@ public:
       const ContainerID& containerId,
       const mesos::slave::ContainerConfig& containerConfig) override;
 
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
+
 private:
-  NamespacesIPCIsolatorProcess();
+  NamespacesIPCIsolatorProcess(const Flags& flags);
+
+  const Flags flags;
 };
 
 } // namespace slave {

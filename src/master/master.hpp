@@ -27,6 +27,7 @@
 
 #include <mesos/mesos.hpp>
 #include <mesos/resources.hpp>
+#include <mesos/roles.hpp>
 #include <mesos/type_utils.hpp>
 
 #include <mesos/maintenance/maintenance.hpp>
@@ -49,6 +50,7 @@
 #include <process/owned.hpp>
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
+#include <process/sequence.hpp>
 #include <process/timer.hpp>
 
 #include <process/metrics/counter.hpp>
@@ -212,8 +214,8 @@ Slave(Master* const _master,
   // Slave becomes disconnected when the socket closes.
   bool connected;
 
-  // Slave becomes deactivated when it gets disconnected. In the
-  // future this might also happen via HTTP endpoint.
+  // Slave becomes deactivated when it gets disconnected, or when the
+  // agent is deactivated via the DRAIN_AGENT or DEACTIVATE_AGENT calls.
   // No offers will be made for a deactivated slave.
   bool active;
 
@@ -313,6 +315,10 @@ Slave(Master* const _master,
 
   SlaveObserver* observer;
 
+  // Time when this agent was last asked to drain. This field
+  // is empty if the agent is not currently draining or drained.
+  Option<process::Time> estimatedDrainStartTime;
+
   struct ResourceProvider {
     ResourceProviderInfo info;
     Resources totalResources;
@@ -367,7 +373,7 @@ public:
 
   // Compare this master's capabilities with registry's minimum capability.
   // Return the set of capabilities missing from this master.
-  static hashset<std::string> misingMinimumCapabilities(
+  static hashset<std::string> missingMinimumCapabilities(
       const MasterInfo& masterInfo, const Registry& registry);
 
   // Message handlers.
@@ -626,7 +632,7 @@ protected:
   // activate it. This happens at most once after master failover, the
   // first time that the framework reregisters with the new master.
   // Exactly one of `newPid` or `http` must be provided.
-  Try<Nothing> activateRecoveredFramework(
+  void activateRecoveredFramework(
       Framework* framework,
       const FrameworkInfo& frameworkInfo,
       const Option<process::UPID>& pid,
@@ -653,16 +659,35 @@ protected:
   // executors and recover the resources.
   void removeFramework(Slave* slave, Framework* framework);
 
+  // Performs actions common for all the framework update paths.
+  //
+  // NOTE: the fields 'id', 'principal', 'name' and 'checkpoint' in the
+  // 'frameworkInfo' should have the same values as in 'framework->info',
+  // otherwise this method terminates the program.
+  //
+  // TODO(asekretenko): Make sending FrameworkInfo updates to slaves, API
+  // subscribers and anywhere else a responsibility of this method -
+  // currently is is not, see MESOS-9746. After that we can remove the
+  // 'sendFrameworkUpdates()' method.
   void updateFramework(
       Framework* framework,
       const FrameworkInfo& frameworkInfo,
       const std::set<std::string>& suppressedRoles);
 
+  void sendFrameworkUpdates(const Framework& framework);
+
   void disconnect(Framework* framework);
   void deactivate(Framework* framework, bool rescind);
 
   void disconnect(Slave* slave);
+
+  // Removes the agent from the resource offer cycle (and rescinds active
+  // offers). Other aspects of the agent will continue to function normally.
   void deactivate(Slave* slave);
+
+  // Adds the agent back to the resource offer cycle.
+  // Must *NOT* be called if the agent is `deactivated`.
+  void reactivate(Slave* slave);
 
   // Add a slave.
   void addSlave(
@@ -961,8 +986,23 @@ protected:
   // Remove an offer after specified timeout
   void offerTimeout(const OfferID& offerId);
 
-  // Remove an offer and optionally rescind the offer as well.
-  void removeOffer(Offer* offer, bool rescind = false);
+  // Methods for removing an offer and handling associated resources.
+  // Both recover the resources in the allocator (optionally setting offer
+  // filters) and remove the offer in the master. `rescindOffer` further
+  // notifies the framework about the rescind.
+  //
+  // NOTE: the `filters` field in `rescindOffers` is needed only as
+  // a workaround for the race between the master and the allocator
+  // which happens when the master tries to free up resources to satisfy
+  // operator initiated operations.
+  void rescindOffer(Offer* offer, const Option<Filters>& filters = None());
+  void discardOffer(Offer* offer, const Option<Filters>& filters = None());
+
+  // Helper for rescindOffer() /  discardOffer() / _accept().
+  // Do not use directly.
+  //
+  // The offer must belong to the framework.
+  void _removeOffer(Framework* framework, Offer* offer);
 
   // Remove an inverse offer after specified timeout
   void inverseOfferTimeout(const OfferID& inverseOfferId);
@@ -1023,24 +1063,38 @@ private:
 
   void subscribe(
       StreamingHttpConnection<v1::scheduler::Event> http,
-      const mesos::scheduler::Call::Subscribe& subscribe);
+      mesos::scheduler::Call::Subscribe&& subscribe);
 
   void _subscribe(
       StreamingHttpConnection<v1::scheduler::Event> http,
-      const FrameworkInfo& frameworkInfo,
+      FrameworkInfo&& frameworkInfo,
       bool force,
-      const std::set<std::string>& suppressedRoles,
+      google::protobuf::RepeatedPtrField<std::string>&& suppressedRoles,
       const process::Future<bool>& authorized);
 
   void subscribe(
       const process::UPID& from,
-      const mesos::scheduler::Call::Subscribe& subscribe);
+      mesos::scheduler::Call::Subscribe&& subscribe);
 
   void _subscribe(
       const process::UPID& from,
-      const FrameworkInfo& frameworkInfo,
+      FrameworkInfo&& frameworkInfo,
       bool force,
-      const std::set<std::string>& suppressedRoles,
+      google::protobuf::RepeatedPtrField<std::string>&& suppressedRoles,
+      const process::Future<bool>& authorized);
+
+  // Update framework via SchedulerDriver (i.e. no response
+  // code feedback, FrameworkErrorMessage on error).
+  void updateFramework(
+      const process::UPID& from,
+      mesos::scheduler::Call::UpdateFramework&& call);
+
+  // Update framework via HTTP API (i.e. returns 200 OK).
+  process::Future<process::http::Response> updateFramework(
+      mesos::scheduler::Call::UpdateFramework&& call);
+
+  process::Future<process::http::Response> _updateFramework(
+      mesos::scheduler::Call::UpdateFramework&& call,
       const process::Future<bool>& authorized);
 
   // Subscribes a client to the 'api/vX' endpoint.
@@ -1057,7 +1111,6 @@ private:
   void _accept(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
-      const Resources& offeredResources,
       mesos::scheduler::Call::Accept&& accept,
       const process::Future<
           std::vector<process::Future<bool>>>& authorizations);
@@ -1073,6 +1126,12 @@ private:
   void declineInverseOffers(
       Framework* framework,
       const mesos::scheduler::Call::DeclineInverseOffers& decline);
+
+  // Should be called after each terminal task status update acknowledgement
+  // or terminal operation acknowledgement. If an agent is draining, this
+  // checks if all pending tasks or operations have terminated and then
+  // transitions the DRAINING agent to DRAINED.
+  void checkAndTransitionDrainingAgent(Slave* slave);
 
   void revive(
       Framework* framework,
@@ -1128,8 +1187,15 @@ private:
       const hashset<SlaveID>& toRemoveGone,
       const process::Future<bool>& registrarResult);
 
-  std::vector<std::string> filterRoles(
-      const process::Owned<ObjectApprovers>& approvers) const;
+  // Returns all roles known to the master, if roles are whitelisted
+  // this simply returns the whitelist and any ancestors of roles in
+  // the whitelist. Otherwise, this returns:
+  //
+  //   (1) Roles with configured weight or quota.
+  //   (2) Roles with reservations.
+  //   (3) Roles with frameworks subscribed or allocated resources.
+  //   (4) Ancestor roles of (1), (2), or (3).
+  std::vector<std::string> knownRoles() const;
 
   /**
    * Returns whether the given role is on the whitelist.
@@ -1140,10 +1206,32 @@ private:
    */
   bool isWhitelistedRole(const std::string& name) const;
 
-  // Validates subscription prerequisites common
-  // both for HTTP and driver-based frameworks.
-  Option<Error> validateFrameworkSubscription(
-      const scheduler::Call::Subscribe&) const;
+  // TODO(bmahler): Store a role tree rather than the existing
+  // `roles` map which does not track the tree correctly (it does
+  // not insert ancestor entries, nor does it track roles if there
+  // are reservations but no frameworks related to them).
+  struct RoleResourceBreakdown
+  {
+  public:
+    RoleResourceBreakdown(const Master* const master_, const std::string& role_)
+      : master(master_), role(role_) {}
+
+    ResourceQuantities offered() const;
+    ResourceQuantities allocated() const;
+    ResourceQuantities reserved() const;
+    ResourceQuantities consumedQuota() const;
+
+  private:
+    const Master* const master;
+    const std::string role;
+  };
+
+  // Performs validations of the FrameworkInfo and suppressed roles set
+  // which do not depend on the current state of this framework.
+  Option<Error> validateFramework(
+      const FrameworkInfo& frameworkInfo,
+      const google::protobuf::RepeatedPtrField<std::string>& suppressedRoles)
+    const;
 
   /**
    * Inner class used to namespace the handling of quota requests.
@@ -1242,15 +1330,26 @@ private:
 
     process::Future<bool> authorizeGetQuota(
         const Option<process::http::authentication::Principal>& principal,
-        const mesos::quota::QuotaInfo& quotaInfo) const;
+        const std::string& role) const;
 
+    // This auth function is used for legacy `SET_QUOTA` and `REMOVE_QUOTA`
+    // calls. Remove this function after the associated API calls are
+    // no longer supported.
     process::Future<bool> authorizeUpdateQuota(
         const Option<process::http::authentication::Principal>& principal,
         const mesos::quota::QuotaInfo& quotaInfo) const;
 
+    process::Future<bool> authorizeUpdateQuotaConfig(
+        const Option<process::http::authentication::Principal>& principal,
+        const mesos::quota::QuotaConfig& quotaConfig) const;
+
     process::Future<mesos::quota::QuotaStatus> _status(
         const Option<process::http::authentication::Principal>&
             principal) const;
+
+    process::Future<process::http::Response> _update(
+        const google::protobuf::RepeatedPtrField<mesos::quota::QuotaConfig>&
+          quotaConfigs) const;
 
     process::Future<process::http::Response> _set(
         const mesos::quota::QuotaRequest& quotaRequest,
@@ -1533,14 +1632,14 @@ private:
         const Option<process::http::authentication::Principal>&
             principal) const;
 
-    // /master/quota
-    process::Future<process::http::Response> quota(
+    // /master/weights
+    process::Future<process::http::Response> weights(
         const process::http::Request& request,
         const Option<process::http::authentication::Principal>&
             principal) const;
 
-    // /master/weights
-    process::Future<process::http::Response> weights(
+    // /master/quota (DEPRECATED).
+    process::Future<process::http::Response> quota(
         const process::http::Request& request,
         const Option<process::http::authentication::Principal>&
             principal) const;
@@ -1617,6 +1716,20 @@ private:
 
     process::Future<process::http::Response> _stopMaintenance(
         const google::protobuf::RepeatedPtrField<MachineID>& machineIds,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    process::Future<process::http::Response> _drainAgent(
+        const SlaveID& slaveId,
+        const Option<DurationInfo>& maxGracePeriod,
+        const bool markGone,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    process::Future<process::http::Response> _deactivateAgent(
+        const SlaveID& slaveId,
+        const process::Owned<ObjectApprovers>& approvers) const;
+
+    process::Future<process::http::Response> _reactivateAgent(
+        const SlaveID& slaveId,
         const process::Owned<ObjectApprovers>& approvers) const;
 
     process::Future<process::http::Response> _reserve(
@@ -1739,6 +1852,21 @@ private:
         ContentType contentType) const;
 
     process::Future<process::http::Response> stopMaintenance(
+        const mesos::master::Call& call,
+        const Option<process::http::authentication::Principal>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> drainAgent(
+        const mesos::master::Call& call,
+        const Option<process::http::authentication::Principal>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> deactivateAgent(
+        const mesos::master::Call& call,
+        const Option<process::http::authentication::Principal>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> reactivateAgent(
         const mesos::master::Call& call,
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
@@ -1890,6 +2018,7 @@ private:
   friend struct Framework;
   friend struct FrameworkMetrics;
   friend struct Metrics;
+  friend struct Role;
   friend struct Slave;
   friend struct SlavesWriter;
   friend struct Subscriber;
@@ -2041,6 +2170,22 @@ private:
     // Slaves that are in the process of being marked gone.
     hashset<SlaveID> markingGone;
 
+    // Agents which have been marked for draining, including recovered,
+    // admitted, and unreachable agents. All draining agents will also
+    // be deactivated. If an agent in this set reregisters, the master
+    // will send it a `DrainSlaveMessage`.
+    //
+    // These values are checkpointed to the registry.
+    hashmap<SlaveID, DrainInfo> draining;
+
+    // Agents which have been deactivated, including recovered, admitted,
+    // and unreachable agents. Agents in this set will not have resource
+    // offers generated and will thus be unable to launch new operations,
+    // but existing operations will be unaffected.
+    //
+    // These values are checkpointed to the registry.
+    hashset<SlaveID> deactivated;
+
     // This collection includes agents that have gracefully shutdown,
     // as well as those that have been marked unreachable or gone. We
     // keep a cache here to prevent this from growing in an unbounded
@@ -2145,6 +2290,12 @@ private:
       Subscriber(const Subscriber&) = delete;
       Subscriber& operator=(const Subscriber&) = delete;
 
+      // Creates object approvers. The futures returned by this method will be
+      // completed in the calling order.
+      process::Future<process::Owned<ObjectApprovers>> getApprovers(
+          const Option<Authorizer*>& authorizer,
+          std::initializer_list<authorization::Action> actions);
+
       // TODO(greggomann): Refactor this function into multiple event-specific
       // overloads. See MESOS-8475.
       void send(
@@ -2165,6 +2316,10 @@ private:
       StreamingHttpConnection<v1::master::Event> http;
       ResponseHeartbeater<mesos::master::Event, v1::master::Event> heartbeater;
       const Option<process::http::authentication::Principal> principal;
+
+      // We maintain a sequence to coordinate the creation of object approvers
+      // in order to sequentialize all events to the subscriber.
+      process::Sequence approversSequence;
     };
 
     // Sends the event to all subscribers connected to the 'api/vX' endpoint.
@@ -2297,14 +2452,6 @@ private:
   process::Time startTime; // Start time used to calculate uptime.
 
   Option<process::Time> electedTime; // Time when this master is elected.
-
-  // Validates the framework including authorization.
-  // Returns None if the framework is valid.
-  // Returns Error if the framework is invalid.
-  // Returns Failure if authorization returns 'Failure'.
-  process::Future<Option<Error>> validate(
-      const FrameworkInfo& frameworkInfo,
-      const process::UPID& from);
 };
 
 
@@ -2631,7 +2778,9 @@ struct Role
 {
   Role() = delete;
 
-  Role(const std::string& _role) : role(_role) {}
+  Role(const Master* _master,
+       const std::string& _role)
+    : master(_master), role(_role) {}
 
   void addFramework(Framework* framework)
   {
@@ -2643,25 +2792,7 @@ struct Role
     frameworks.erase(framework->id());
   }
 
-  Resources allocatedResources() const
-  {
-    Resources resources;
-
-    auto allocatedTo = [](const std::string& role) {
-      return [role](const Resource& resource) {
-        CHECK(resource.has_allocation_info());
-        return resource.allocation_info().role() == role;
-      };
-    };
-
-    foreachvalue (Framework* framework, frameworks) {
-      resources += framework->totalUsedResources.filter(allocatedTo(role));
-      resources += framework->totalOfferedResources.filter(allocatedTo(role));
-    }
-
-    return resources;
-  }
-
+  const Master* master;
   const std::string role;
 
   // NOTE: The dynamic role/quota relation is stored in and administrated

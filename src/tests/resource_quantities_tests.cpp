@@ -24,15 +24,13 @@
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 
+#include <mesos/resources.hpp>
+#include <mesos/resource_quantities.hpp>
 #include <mesos/values.hpp>
-
-#include "common/resource_quantities.hpp"
 
 using std::pair;
 using std::string;
 using std::vector;
-
-using mesos::internal::ResourceQuantities;
 
 namespace mesos {
 namespace internal {
@@ -539,6 +537,40 @@ TEST(LimitsTest, ContainsQuantities)
   limits = CHECK_NOTERROR(ResourceLimits::fromString("cpus:2;mem:1"));
   quantities = CHECK_NOTERROR(ResourceQuantities::fromString("cpus:2;mem:2"));
   EXPECT_FALSE(limits.contains(quantities));
+}
+
+
+TEST(LimitsTest, SubtractQuantities)
+{
+  auto limits = [](const string& resourceLimitsString) {
+    return CHECK_NOTERROR(ResourceLimits::fromString(resourceLimitsString));
+  };
+
+  auto subtract = [](const string& resourceLimitsString,
+                     const string& resourceQuantitiesString) {
+    ResourceLimits limits =
+      CHECK_NOTERROR(ResourceLimits::fromString(resourceLimitsString));
+    ResourceQuantities quantities =
+      CHECK_NOTERROR(ResourceQuantities::fromString(resourceQuantitiesString));
+
+    return limits - quantities;
+  };
+
+  EXPECT_EQ(limits(""), subtract("", ""));
+  EXPECT_EQ(limits(""), subtract("", "cpus:10"));
+
+  EXPECT_EQ(limits("cpus:1"), subtract("cpus:1", ""));
+
+  EXPECT_EQ(limits("cpus:0"), subtract("cpus:1", "cpus:1"));
+  EXPECT_EQ(limits("cpus:0"), subtract("cpus:1", "cpus:2"));
+
+  EXPECT_EQ(limits("cpus:0;mem:10"), subtract("cpus:1;mem:10", "cpus:1"));
+  EXPECT_EQ(
+      limits("cpus:0;mem:10"), subtract("cpus:1;mem:10", "cpus:1;disk:10"));
+
+  EXPECT_EQ(
+      limits("cpus:0;mem:5"),
+      subtract("cpus:1;mem:10", "cpus:1;mem:5;disk:10"));
 }
 
 

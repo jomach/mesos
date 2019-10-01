@@ -35,15 +35,6 @@ fsutil reparsepoint query "support" | find "Symbolic Link" >nul && (
   goto not_in_root
 )
 
-:: Install mesos default hooks and gitignore template.
-if not exist .git\hooks\pre-commit (
-  mklink .git\hooks\pre-commit ..\..\support\hooks\pre-commit
-)
-
-if not exist .git\hooks\post-rewrite (
-  mklink .git\hooks\post-rewrite ..\..\support\hooks\post-rewrite
-)
-
 if not exist .gitignore (
   mklink .gitignore support\gitignore
 )
@@ -56,13 +47,30 @@ if not exist .clang-format (
   mklink .clang-format support\clang-format
 )
 
+if not exist CPPLINT.cfg (
+  mklink CPPLINT.cfg support\CPPLINT.cfg
+)
+
+if not exist .gitlint (
+  mklink .gitlint support\gitlint
+)
+
+if not exist .pre-commit-config.yaml (
+  mklink .pre-commit-config.yaml support\pre-commit-config.yaml
+)
+
+:: Install mesos default hooks and gitignore template.
+pre-commit install-hooks
+pre-commit install --hook-type pre-commit
+pre-commit install --hook-type commit-msg
+
 goto:eof
 
 
 :: If we are not in the root directory, print error and exit.
 :not_in_root
 echo. 1>&2
-echo You must run bootstrap from the root of the distribution. 1>&2
+echo You must run support/setup-dev.bat from the root of the distribution. 1>&2
 echo. 1>&2
 
 exit /b 1

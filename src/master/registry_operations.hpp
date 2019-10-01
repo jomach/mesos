@@ -137,6 +137,71 @@ private:
   const TimeInfo goneTime;
 };
 
+
+// Marks an existing agent for draining.
+// Also adds a minimum capability to the master for AGENT_DRAINING.
+class DrainAgent : public RegistryOperation
+{
+public:
+  DrainAgent(
+      const SlaveID& _slaveId,
+      const Option<DurationInfo>& _maxGracePeriod,
+      const bool _markGone);
+
+protected:
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
+
+private:
+  const SlaveID slaveId;
+  const Option<DurationInfo> maxGracePeriod;
+  const bool markGone;
+};
+
+
+// Transitions a DRAINING agent into the DRAINED state.
+class MarkAgentDrained : public RegistryOperation
+{
+public:
+  MarkAgentDrained(const SlaveID& _slaveId);
+
+protected:
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
+
+private:
+  const SlaveID slaveId;
+};
+
+
+// Marks an existing agent as deactivated.
+// Also adds a minimum capability to the master for AGENT_DRAINING.
+class DeactivateAgent : public RegistryOperation
+{
+public:
+  DeactivateAgent(const SlaveID& _slaveId);
+
+protected:
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
+
+private:
+  const SlaveID slaveId;
+};
+
+
+// Clears draining or deactivation from an existing agent.
+// If there are no remaining draining or deactivated agents,
+// this also clears the minimum capability for AGENT_DRAINING.
+class ReactivateAgent : public RegistryOperation
+{
+public:
+  ReactivateAgent(const SlaveID& _slaveId);
+
+protected:
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
+
+private:
+  const SlaveID slaveId;
+};
+
 } // namespace master {
 } // namespace internal {
 } // namespace mesos {

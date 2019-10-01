@@ -356,7 +356,7 @@ Future<http::Response> ResourceProviderManagerProcess::api(
 
         Call call = devolve(v1Call);
 
-        Option<Error> error = validate(call);
+        Option<Error> error = validate(call, None());
         if (error.isSome()) {
           return BadRequest(
               "Failed to validate resource_provider::Call: " + error->message);
@@ -405,9 +405,15 @@ Future<http::Response> ResourceProviderManagerProcess::api(
           return BadRequest("Resource provider is not subscribed");
         }
 
-        ResourceProvider* resourceProvider =
-          this->resourceProviders.subscribed.at(call.resource_provider_id())
-            .get();
+        ResourceProvider* resourceProvider = CHECK_NOTNULL(
+            this->resourceProviders.subscribed.at(call.resource_provider_id())
+              .get());
+
+        // Perform additional validation with the now known provider info.
+        error = validate(call, resourceProvider->info);
+        if (error.isSome()) {
+          return BadRequest("Inconsistent call: " + error->message);
+        }
 
         // This isn't a `SUBSCRIBE` call, so the request should include a stream
         // ID.

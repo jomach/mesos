@@ -1,7 +1,6 @@
 FROM centos:6
 MAINTAINER Kapil Arya <kapil@apache.org>
 
-# Get curl.
 RUN yum install -y              \
       centos-release-scl        \
       epel-release              \
@@ -10,6 +9,11 @@ RUN yum install -y              \
       rpm-build                 \
       scl-utils                 \
       yum-utils
+
+# We need to install `devtoolset-7` in a separate step because the
+# repository containing it only gets added during installation of
+# the `centos-release-scl` package.
+RUN yum install -y devtoolset-7
 
 # Add the Subversion repo.
 RUN echo -e '[WANdiscoSVN]\n\
@@ -27,7 +31,7 @@ RUN curl -sSL \
 
 # PostgreSQL repo for libevent2.
 RUN  rpm -Uvh --replacepkgs \
-      http://yum.postgresql.org/9.5/redhat/rhel-6-x86_64/pgdg-centos95-9.5-2.noarch.rpm
+      http://yum.postgresql.org/9.5/redhat/rhel-6-x86_64/pgdg-centos95-9.5-3.noarch.rpm
 
 # Setup JDK
 RUN echo -e 'export JAVA_HOME=/usr/lib/jvm/java-openjdk' >> /etc/profile.d/java-home.sh

@@ -198,6 +198,17 @@
     $scope.unreachable_agents = $scope.state.unreachable_slaves;
 
     _.each($scope.state.slaves, function(agent) {
+      // Calculate the agent "state" from activation and drain state.
+      if (!agent.deactivated) {
+        agent.state = "Active";
+      } else if (agent.drain_info) {
+        // Transform the drain state so only the first letter is capitalized.
+        var s = agent.drain_info.state;
+        agent.state = s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+      } else {
+        agent.state = "Deactivated";
+      }
+
       $scope.agents[agent.id] = agent;
       $scope.total_cpus += agent.resources.cpus;
       $scope.total_gpus += agent.resources.gpus;
@@ -604,6 +615,15 @@
       update();
     }
 
+    $scope.show_weight = false;
+    $scope.show_framework_count = false;
+    $scope.show_offered = false;
+    $scope.show_allocated = true;
+    $scope.show_reserved = true;
+    $scope.show_quota_consumption = true;
+    $scope.show_quota_guarantee = false;
+    $scope.show_quota_limit = true;
+
     var removeListener = $scope.$on('state_updated', update);
     $scope.$on('$routeChangeStart', removeListener);
   });
@@ -700,6 +720,13 @@
           // The agent attaches a "/slave/log" file when either
           // of these flags are set.
           $scope.agent.log_file_attached = $scope.state.external_log_file || $scope.state.log_dir;
+
+          $scope.agent.drain_config = response.drain_config;
+          if (response.estimated_drain_start_time_seconds && response.drain_config.max_grace_period) {
+            $scope.agent.estimated_drain_end_time_seconds =
+              response.estimated_drain_start_time_seconds +
+              (response.drain_config.max_grace_period.nanoseconds / 1000000000);
+          }
 
           // Convert the reserved resources map into an array for inclusion
           // in an `ng-repeat` table.

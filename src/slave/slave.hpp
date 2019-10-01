@@ -129,6 +129,7 @@ public:
         mesos::slave::QoSController* qosController,
         mesos::SecretGenerator* secretGenerator,
         VolumeGidManager* volumeGidManager,
+        PendingFutureTracker* futureTracker,
         const Option<Authorizer*>& authorizer);
 
   ~Slave() override;
@@ -226,10 +227,27 @@ public:
       const std::vector<ResourceVersionUUID>& resourceVersionUuids,
       const Option<bool>& launchExecutor);
 
-  // Made 'virtual' for Slave mocking.
+  // Handler for the `KillTaskMessage`. Made 'virtual' for Slave mocking.
   virtual void killTask(
       const process::UPID& from,
       const KillTaskMessage& killTaskMessage);
+
+  // Helper to kill a pending task, which may or may not be associated with a
+  // valid `Executor` struct.
+  void killPendingTask(
+      const FrameworkID& frameworkId,
+      Framework* framework,
+      const TaskID& taskId);
+
+  // Helper to kill a task belonging to a valid framework and executor. This
+  // function should be used to kill tasks which are queued or launched, but
+  // not tasks which are pending.
+  void kill(
+      const FrameworkID& frameworkId,
+      Framework* framework,
+      Executor* executor,
+      const TaskID& taskId,
+      const Option<KillPolicy>& killPolicy);
 
   // Made 'virtual' for Slave mocking.
   virtual void shutdownExecutor(
@@ -268,7 +286,8 @@ public:
   void checkpointResourcesMessage(
       const std::vector<Resource>& resources);
 
-  void applyOperation(const ApplyOperationMessage& message);
+  // Made 'virtual' for Slave mocking.
+  virtual void applyOperation(const ApplyOperationMessage& message);
 
   // Reconciles pending operations with the master. This is necessary to handle
   // cases in which operations were dropped in transit, or in which an agent's
@@ -374,6 +393,10 @@ public:
   void operationStatusAcknowledgement(
       const process::UPID& from,
       const AcknowledgeOperationStatusMessage& acknowledgement);
+
+  void drain(
+      const process::UPID& from,
+      DrainSlaveMessage&& drainSlaveMessage);
 
   void executorLaunched(
       const FrameworkID& frameworkId,
@@ -846,6 +869,8 @@ private:
 
   VolumeGidManager* volumeGidManager;
 
+  PendingFutureTracker* futureTracker;
+
   const Option<Authorizer*> authorizer;
 
   // The most recent estimate of the total amount of oversubscribed
@@ -884,6 +909,18 @@ private:
 
   // Operations that are checkpointed by the agent.
   hashmap<UUID, Operation> checkpointedOperations;
+
+  // If the agent is currently draining, contains the configuration used to
+  // drain the agent. If NONE, the agent is not currently draining.
+  Option<DrainConfig> drainConfig;
+
+  // Time when this agent was last asked to drain. This field
+  // is empty if the agent is not currently draining.
+  Option<process::Time> estimatedDrainStartTime;
+
+  // Check whether draining is finished and possibly remove
+  // both in-memory and persisted drain configuration.
+  void updateDrainStatus();
 };
 
 
@@ -917,6 +954,9 @@ public:
   void checkpointTask(const Task& task);
 
   void recoverTask(const state::TaskState& state, bool recheckpointTask);
+
+  void addPendingTaskStatus(const TaskStatus& status);
+  void removePendingTaskStatus(const TaskStatus& status);
 
   Try<Nothing> updateTaskState(const TaskStatus& status);
 
@@ -1061,6 +1101,9 @@ public:
   // information sent in the status updates for any remaining
   // non-terminal tasks.
   Option<mesos::slave::ContainerTermination> pendingTermination;
+
+  // Task status updates that are being processed by the agent.
+  hashmap<TaskID, LinkedHashMap<id::UUID, TaskStatus>> pendingStatusUpdates;
 
 private:
   Executor(const Executor&) = delete;

@@ -28,11 +28,11 @@
 #include <stout/json.hpp>
 #include <stout/protobuf.hpp>
 
+#include <mesos/resource_quantities.hpp>
 #include <mesos/resources.hpp>
 
 #include <mesos/v1/resources.hpp>
 
-#include "common/resource_quantities.hpp"
 #include "common/resources_utils.hpp"
 
 #include "internal/evolve.hpp"
@@ -58,8 +58,6 @@ using google::protobuf::RepeatedPtrField;
 using mesos::internal::evolve;
 
 using mesos::internal::protobuf::createLabel;
-
-using mesos::internal::ResourceQuantities;
 
 namespace mesos {
 namespace internal {
@@ -1872,6 +1870,136 @@ TEST(ResourcesTest, Find)
   Resources targets4 = Resources::parse("cpus(role1):2;mem(role1):2").get();
 
   EXPECT_NONE(resources4.find(targets4));
+}
+
+
+// This test verifies the correctness of shrinking resources to the target
+// resource quantities.
+TEST(ResourcesTest, ShrinkToQuantities)
+{
+  auto shrink = [](const Resources& resources, const string& quantitiesString) {
+    ResourceQuantities quantities =
+      CHECK_NOTERROR(ResourceQuantities::fromString(quantitiesString));
+
+    return shrinkResources(resources, quantities);
+  };
+
+  // Emptiness.
+  Resources empty;
+  EXPECT_EQ(empty, shrink(empty, ""));
+  EXPECT_EQ(empty, shrink(empty, "cpus:1"));
+
+  // Simple shrink.
+  Resources cpu1 = CHECK_NOTERROR(Resources::parse("cpus:1"));
+  EXPECT_EQ(empty, shrink(cpu1, ""));
+
+  Resources cpu2 = CHECK_NOTERROR(Resources::parse("cpus:2"));
+  EXPECT_EQ(cpu1, shrink(cpu2, "cpus:1"));
+
+  // Multiple resources.
+  Resources cpu2mem20 = CHECK_NOTERROR(Resources::parse("cpus:2;mem:20"));
+  Resources cpu1mem10 = CHECK_NOTERROR(Resources::parse("cpus:1;mem:10"));
+  EXPECT_EQ(cpu1mem10, shrink(cpu2mem20, "cpus:1;mem:10"));
+  EXPECT_EQ(cpu1mem10, shrink(cpu2mem20, "cpus:1;mem:10;disk:10"));
+  EXPECT_EQ(cpu1, shrink(cpu2mem20, "cpus:1"));
+
+  // Non-choppable resources.
+  Resources mountDisk20 = createDiskResource(
+      "20", "role", None(), None(), createDiskSourceMount("mnt"));
+  EXPECT_EQ(Resources(), shrink(mountDisk20, "disk:10"));
+
+  // Random chopping.
+  //
+  // We construct 20 disk resources consisted of 10 regular disk and
+  // 10 mount disk. A chopping of 10 disk should make a random choice
+  // of picking either the regular disk or the mount disk.
+  Resources regularDisk10 = CHECK_NOTERROR(Resources::parse("disk:10"));
+  Resources mountDisk10 = createDiskResource(
+      "10", "role", None(), None(), createDiskSourceMount("mnt"));
+  Resources combinedDisk20 = regularDisk10 + mountDisk10;
+
+  // A chopping of 10 disk could return either 10 regular disk or
+  // 10 mount disk.
+  Resources shrunk10 = shrink(combinedDisk20, "disk:10");
+
+  // Repeat the same chopping for 1000 times, expecting the chopping
+  // result to be different from the first time at least once.
+  const size_t count = 1000u;
+  bool atLeastDifferentOnce = false;
+
+  for (size_t i = 0; i < count; i++) {
+    if (shrink(combinedDisk20, "disk:10") != shrunk10) {
+      atLeastDifferentOnce = true;
+      break;
+    }
+  }
+  CHECK(atLeastDifferentOnce);
+}
+
+
+// This test verifies the correctness of shrinking resources to the target
+// resource limits.
+TEST(ResourcesTest, ShrinkToLimits)
+{
+  auto shrink = [](const Resources& resources, const string& limitsString) {
+    ResourceLimits limits =
+      CHECK_NOTERROR(ResourceLimits::fromString(limitsString));
+
+    return shrinkResources(resources, limits);
+  };
+
+  // Emptiness.
+  Resources empty;
+  EXPECT_EQ(empty, shrink(empty, ""));
+  EXPECT_EQ(empty, shrink(empty, "cpus:1"));
+
+  // Simple shrink.
+  Resources cpu1 = CHECK_NOTERROR(Resources::parse("cpus:1"));
+  EXPECT_EQ(cpu1, shrink(cpu1, ""));
+
+  Resources cpu2 = CHECK_NOTERROR(Resources::parse("cpus:2"));
+  EXPECT_EQ(cpu1, shrink(cpu2, "cpus:1"));
+
+  // Multiple resources.
+  Resources cpu2mem20 = CHECK_NOTERROR(Resources::parse("cpus:2;mem:20"));
+  Resources cpu1mem10 = CHECK_NOTERROR(Resources::parse("cpus:1;mem:10"));
+  EXPECT_EQ(cpu1mem10, shrink(cpu2mem20, "cpus:1;mem:10"));
+  EXPECT_EQ(cpu1mem10, shrink(cpu2mem20, "cpus:1;mem:10;disk:10"));
+
+  Resources cpu1mem20 = CHECK_NOTERROR(Resources::parse("cpus:1;mem:20"));
+  EXPECT_EQ(cpu1mem20, shrink(cpu2mem20, "cpus:1"));
+
+  // Non-choppable resources.
+  Resources mountDisk20 = createDiskResource(
+      "20", "role", None(), None(), createDiskSourceMount("mnt"));
+  EXPECT_EQ(Resources(), shrink(mountDisk20, "disk:10"));
+
+  // Random chopping.
+  //
+  // We construct 20 disk resources consisted of 10 regular disk and
+  // 10 mount disk. A chopping of 10 disk should make a random choice
+  // of picking either the regular disk or the mount disk.
+  Resources regularDisk10 = CHECK_NOTERROR(Resources::parse("disk:10"));
+  Resources mountDisk10 = createDiskResource(
+      "10", "role", None(), None(), createDiskSourceMount("mnt"));
+  Resources combinedDisk20 = regularDisk10 + mountDisk10;
+
+  // A chopping of 10 disk could return either 10 regular disk or
+  // 10 mount disk.
+  Resources shrunk10 = shrink(combinedDisk20, "disk:10");
+
+  // Repeat the same chopping for 1000 times, expecting the chopping
+  // result to be different from the first time at least once.
+  const size_t count = 1000u;
+  bool atLeastDifferentOnce = false;
+
+  for (size_t i = 0; i < count; i++) {
+    if (shrink(combinedDisk20, "disk:10") != shrunk10) {
+      atLeastDifferentOnce = true;
+      break;
+    }
+  }
+  CHECK(atLeastDifferentOnce);
 }
 
 

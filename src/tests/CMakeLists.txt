@@ -48,8 +48,8 @@ set(MESOS_TESTS_UTILS_SRC
   flags.cpp
   http_server_test_helper.cpp
   main.cpp
+  master/mock_master_api_subscriber.cpp
   mesos.cpp
-  mock_csi_plugin.cpp
   mock_docker.cpp
   mock_fetcher.cpp
   mock_registrar.cpp
@@ -62,6 +62,7 @@ set(MESOS_TESTS_UTILS_SRC
 if (NOT WIN32)
   list(APPEND MESOS_TESTS_UTILS_SRC
     kill_policy_test_helper.cpp
+    mock_csi_plugin.cpp
     script.cpp
     containerizer/memory_test_helper.cpp)
 endif ()
@@ -90,8 +91,6 @@ set(MESOS_TESTS_SRC
   container_daemon_tests.cpp
   cram_md5_authentication_tests.cpp
   credentials_tests.cpp
-  csi_client_tests.cpp
-  csi_utils_tests.cpp
   default_executor_tests.cpp
   exception_tests.cpp
   executor_http_api_tests.cpp
@@ -106,9 +105,11 @@ set(MESOS_TESTS_SRC
   hook_tests.cpp
   http_authentication_tests.cpp
   http_fault_tolerance_tests.cpp
+  master_draining_tests.cpp
   master_load_tests.cpp
   master_maintenance_tests.cpp
   master_slave_reconciliation_tests.cpp
+  master/update_framework_tests.cpp
   operation_reconciliation_tests.cpp
   operation_status_update_manager_tests.cpp
   partition_tests.cpp
@@ -152,6 +153,7 @@ if (ENABLE_SSL)
 endif ()
 
 list(APPEND MESOS_TESTS_SRC
+  common/future_tracker_tests.cpp
   common/http_tests.cpp
   common/recordio_tests.cpp
   common/type_utils_tests.cpp)
@@ -160,13 +162,14 @@ list(APPEND MESOS_TESTS_SRC
   containerizer/containerizer_tests.cpp
   containerizer/cpu_isolator_tests.cpp
   containerizer/docker_containerizer_tests.cpp
-  containerizer/docker_spec_tests.cpp
   containerizer/docker_tests.cpp
   containerizer/memory_isolator_tests.cpp)
 
 if (NOT WIN32)
   list(APPEND MESOS_TESTS_SRC
     container_logger_tests.cpp
+    csi_client_tests.cpp
+    csi_utils_tests.cpp
     disk_profile_adaptor_tests.cpp
     disk_quota_tests.cpp
     dynamic_weights_tests.cpp
@@ -202,6 +205,7 @@ if (NOT WIN32)
   list(APPEND MESOS_TESTS_SRC
     containerizer/appc_spec_tests.cpp
     containerizer/composing_containerizer_tests.cpp
+    containerizer/docker_spec_tests.cpp
     containerizer/environment_secret_isolator_tests.cpp
     containerizer/io_switchboard_tests.cpp
     containerizer/isolator_tests.cpp
@@ -229,6 +233,7 @@ if (LINUX)
     containerizer/docker_volume_isolator_tests.cpp
     containerizer/fs_tests.cpp
     containerizer/linux_capabilities_isolator_tests.cpp
+    containerizer/linux_nnp_isolator_tests.cpp
     containerizer/linux_devices_isolator_tests.cpp
     containerizer/linux_filesystem_isolator_tests.cpp
     containerizer/memory_pressure_tests.cpp
@@ -378,4 +383,6 @@ endif ()
 
 # ADD TEST TARGET (runs when you do, e.g., `make check`).
 #########################################################
-add_test(NAME MesosTests COMMAND mesos-tests)
+add_test(NAME MesosTests COMMAND ${TEST_DRIVER} "${CMAKE_BINARY_DIR}/src/mesos-tests")
+set_property(TEST MesosTests PROPERTY ENVIRONMENT
+  "MESOS_GTEST_RUNNER_FLAGS=--sequential=*ROOT_* $ENV{MESOS_GTEST_RUNNER_FLAGS}")

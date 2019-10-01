@@ -56,6 +56,16 @@
         </span>
       </p>
 
+      <span ng-if="agent.drain_config">
+        <h4>Draining</h4>
+        <dl class="inline clearfix">
+          <dt>Mark gone:</dt>
+          <dd>{{agent.drain_config.mark_gone}}</dd>
+          <dt ng-if="agent.estimated_drain_end_time_seconds">Estimated drain end time:</dt>
+          <dd ng-if="agent.estimated_drain_end_time_seconds"><time>{{agent.estimated_drain_end_time_seconds * 1000| isoDate}}</time></dd>
+        </dl>
+      </span>
+
       <h4>Tasks</h4>
       <table class="table table-condensed">
         <tbody>

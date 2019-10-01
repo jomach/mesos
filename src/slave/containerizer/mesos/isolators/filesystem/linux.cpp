@@ -61,6 +61,7 @@ using std::string;
 using std::vector;
 
 using mesos::internal::protobuf::slave::createContainerMount;
+using mesos::internal::protobuf::slave::containerSymlinkOperation;
 
 using mesos::slave::ContainerClass;
 using mesos::slave::ContainerConfig;
@@ -145,12 +146,21 @@ static const ContainerMountInfo ROOTFS_CONTAINER_MOUNTS[] = {
       "devpts",
       "newinstance,ptmxmode=0666,mode=0620,gid=5",
       MS_NOSUID | MS_NOEXEC),
-  createContainerMount(
-      "tmpfs",
-      "/dev/shm",
-      "tmpfs",
-      "mode=1777",
-      MS_NOSUID | MS_NODEV | MS_STRICTATIME),
+};
+
+
+static const vector<string> ROOTFS_MASKED_PATHS = {
+  "/proc/acpi",
+  "/proc/asound",
+  "/proc/kcore",
+  "/proc/keys",
+  "/proc/key-users",
+  "/proc/latency_stats",
+  "/proc/sched_debug",
+  "/proc/scsi",
+  "/proc/timer_list",
+  "/proc/timer_stats",
+  "/sys/firmware",
 };
 
 
@@ -198,13 +208,8 @@ static Try<Nothing> makeStandardDevices(
   };
 
   foreach (const auto& symlink, symlinks) {
-    CommandInfo* ln = launchInfo.add_pre_exec_commands();
-    ln->set_shell(false);
-    ln->set_value("ln");
-    ln->add_arguments("ln");
-    ln->add_arguments("-s");
-    ln->add_arguments(symlink.first);
-    ln->add_arguments(symlink.second);
+    *launchInfo.add_file_operations() =
+      containerSymlinkOperation(symlink.first, symlink.second);
   }
 
   // TODO(idownes): Set up console device.
@@ -451,6 +456,44 @@ static Try<Nothing> ensureAllowDevices(const string& _targetDir)
 }
 
 
+// We define a container is privileged if it is sharing the PID
+// namespace with the host. For nested containers, we walk up
+// the tree and verify it is shared all the way up to the root.
+static Try<bool> isPrivilegedContainer(
+    const string runtimeDir,
+    const ContainerID& containerId,
+    const ContainerConfig& containerConfig)
+{
+  if (!containerConfig.container_info().linux_info().share_pid_namespace()) {
+    return false;
+  }
+
+  CHECK(containerConfig.container_info().linux_info().share_pid_namespace());
+
+  // If we are a root container, we are privileged because we share
+  // the host's PID namespace.
+  if (!containerId.has_parent()) {
+    return true;
+  }
+
+  // If we are a nested container, we have to walk up the container tree.
+  ContainerID parentId = containerId.parent();
+  Result<ContainerConfig> parentConfig =
+    containerizer::paths::getContainerConfig(runtimeDir, parentId);
+
+  if (parentConfig.isNone()) {
+    return Error(
+        "Failed to find config for parent container " + stringify(parentId));
+  }
+
+  if (parentConfig.isError()) {
+    return Error(parentConfig.error());
+  }
+
+  return isPrivilegedContainer(runtimeDir, parentId, parentConfig.get());
+}
+
+
 Try<Isolator*> LinuxFilesystemIsolatorProcess::create(
     const Flags& flags,
     VolumeGidManager* volumeGidManager)
@@ -500,16 +543,6 @@ Try<Isolator*> LinuxFilesystemIsolatorProcess::create(
     return Error(
         "Failed to create container's runtime dir at '" +
         containersRuntimeDir + "': " + mkdir.error());
-  }
-
-  // Create sandbox directory. We will bind mount the sandbox of nested
-  // container which does not have its own rootfs to this directory. See
-  // `prepare` for details.
-  mkdir = os::mkdir(flags.sandbox_directory);
-  if (mkdir.isError()) {
-    return Error(
-        "Failed to create sandbox directory at '" +
-        flags.sandbox_directory + "': " + mkdir.error());
   }
 
   Try<Nothing> containersDirMount = ensureAllowDevices(containersRuntimeDir);
@@ -730,6 +763,19 @@ Future<Option<ContainerLaunchInfo>> LinuxFilesystemIsolatorProcess::prepare(
       }
     }
 
+    // If `namespaces/ipc` isolator is not enabled, for backward compatibility
+    // we will keep the previous behavior: if the container has its own rootfs,
+    // it will have its own /dev/shm, otherwise it will share agent's /dev/shm.
+    // If `namespaces/ipc` isolator is enabled, /dev/shm will be handled there.
+    if (!strings::contains(flags.isolation, "namespaces/ipc")) {
+      *launchInfo.add_mounts() = createContainerMount(
+          "tmpfs",
+          path::join(containerConfig.rootfs(), "/dev/shm"),
+          "tmpfs",
+          "mode=1777",
+          MS_NOSUID | MS_NODEV | MS_STRICTATIME);
+    }
+
     Try<Nothing> makedev =
       makeStandardDevices(devicesDir, containerConfig.rootfs(), launchInfo);
     if (makedev.isError()) {
@@ -754,19 +800,20 @@ Future<Option<ContainerLaunchInfo>> LinuxFilesystemIsolatorProcess::prepare(
 
     *launchInfo.add_mounts() = createContainerMount(
         containerConfig.directory(), sandbox, MS_BIND | MS_REC);
-  } else if (containerId.has_parent()) {
-    // For nested container which does not have its own rootfs, bind mount its
-    // sandbox to the directory specified via `flags.sandbox_directory` (e.g.,
-    // `/mnt/mesos/sandbox`) in its own mount namespace and set the environment
-    // variable `MESOS_SANDBOX` to `flags.sandbox_directory` (see the `_launch`
-    // method of `MesosContainerizerProcess` for details). The reason that we do
-    // this is, in MESOS-8332 we narrowed task sandbox permissions from 0755 to
-    // 0750, since nested container's sandbox is subdirectory under its parent's
-    // sandbox, if we still set `MESOS_SANDBOX` to `containerConfig.directory()`
-    // for nested container, it will not have permission to access its sandbox
-    // via `MESOS_SANDBOX` if its user is different from its parent's user.
-    *launchInfo.add_mounts() = createContainerMount(
-        containerConfig.directory(), flags.sandbox_directory, MS_BIND | MS_REC);
+
+    Try<bool> privileged =
+      isPrivilegedContainer(flags.runtime_dir, containerId, containerConfig);
+    if (privileged.isError()) {
+      return Failure(privileged.error());
+    }
+
+    // Apply container path masking for non-privileged containers.
+    if (!privileged.get()) {
+      foreach (const string& path, ROOTFS_MASKED_PATHS) {
+        launchInfo.add_masked_paths(
+            path::join(containerConfig.rootfs(), path));
+      }
+    }
   }
 
   // Currently, we only need to update resources for top level containers.

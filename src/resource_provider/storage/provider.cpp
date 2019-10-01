@@ -38,6 +38,7 @@
 
 #include <mesos/v1/resource_provider.hpp>
 
+#include <process/after.hpp>
 #include <process/collect.hpp>
 #include <process/defer.hpp>
 #include <process/delay.hpp>
@@ -57,6 +58,7 @@
 #include <stout/foreach.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
+#include <stout/lambda.hpp>
 #include <stout/linkedhashmap.hpp>
 #include <stout/nothing.hpp>
 #include <stout/os.hpp>
@@ -78,6 +80,7 @@
 #include "internal/devolve.hpp"
 #include "internal/evolve.hpp"
 
+#include "resource_provider/constants.hpp"
 #include "resource_provider/detector.hpp"
 #include "resource_provider/state.hpp"
 
@@ -129,6 +132,7 @@ using mesos::internal::protobuf::convertLabelsToStringMap;
 using mesos::internal::protobuf::convertStringMapToLabels;
 
 using mesos::resource_provider::Call;
+using mesos::resource_provider::DEFAULT_STORAGE_RECONCILIATION_INTERVAL;
 using mesos::resource_provider::Event;
 using mesos::resource_provider::ResourceProviderState;
 
@@ -272,12 +276,23 @@ private:
   // truth, such as CSI plugin responses or the status update manager.
   Future<Nothing> reconcileResourceProviderState();
   Future<Nothing> reconcileOperationStatuses();
-  ResourceConversion reconcileResources(
-      const Resources& checkpointed,
-      const Resources& discovered);
 
-  Future<Resources> getRawVolumes();
-  Future<Resources> getStoragePools();
+  // Query the plugin for its resources and update the providers
+  // state. If `alwaysUpdate` is `true` an update will always be
+  // sent, even if no changes are detected.
+  Future<Nothing> reconcileResources(bool alwaysUpdate);
+
+  ResourceConversion computeConversion(
+      const Resources& checkpointed, const Resources& discovered) const;
+
+  // Returns a list of resource conversions to updates volume contexts for
+  // existing volumes, remove disappeared unconverted volumes, and add newly
+  // appeared ones.
+  Future<vector<ResourceConversion>> getExistingVolumes();
+
+  // Returns a list of resource conversions to remove disappeared unconverted
+  // storage pools and add newly appeared ones.
+  Future<vector<ResourceConversion>> getStoragePools();
 
   // Spawns a loop to watch for changes in the set of known profiles and update
   // the profile mapping and storage pools accordingly.
@@ -288,10 +303,6 @@ private:
   // profile, the resource provider will continue to operate with the
   // set of profiles it knows about.
   Future<Nothing> updateProfiles(const hashset<string>& profiles);
-
-  // Reconcile the storage pools when the set of known profiles changes,
-  // or a volume with an unknown profile is destroyed.
-  Future<Nothing> reconcileStoragePools();
 
   // Returns true if the storage pools are allowed to be reconciled when
   // the operation is being applied.
@@ -304,6 +315,13 @@ private:
   void acknowledgeOperationStatus(
       const Event::AcknowledgeOperationStatus& acknowledge);
   void reconcileOperations(const Event::ReconcileOperations& reconcile);
+
+  // Periodically poll the provider for resource changes. The poll interval is
+  // controlled by
+  // `ResourceProviderInfo.Storage.reconciliation_interval_seconds`. When this
+  // function is invoked it will perform the first poll after one reconciliation
+  // interval.
+  void watchResources();
 
   // Applies the operation. Speculative operations will be synchronously
   // applied. Do nothing if the operation is already in a terminal state.
@@ -366,6 +384,8 @@ private:
   const SlaveID slaveId;
   const Option<string> authToken;
   const bool strict;
+
+  const Duration reconciliationInterval;
 
   shared_ptr<DiskProfileAdaptor> diskProfileAdaptor;
 
@@ -436,6 +456,10 @@ StorageLocalResourceProviderProcess::StorageLocalResourceProviderProcess(
     slaveId(_slaveId),
     authToken(_authToken),
     strict(_strict),
+    reconciliationInterval(
+        _info.storage().has_reconciliation_interval_seconds()
+          ? Seconds(info.storage().reconciliation_interval_seconds())
+          : DEFAULT_STORAGE_RECONCILIATION_INTERVAL),
     metrics("resource_providers/" + info.type() + "." + info.name() + "/"),
     resourceVersion(id::UUID::random()),
     sequence("storage-local-resource-provider-sequence")
@@ -649,8 +673,10 @@ Future<Nothing> StorageLocalResourceProviderProcess::recover()
         }
       }
 
-      LOG(INFO) << "Finished recovery for resource provider with type '"
-                << info.type() << "' and name '" << info.name() << "'";
+      LOG(INFO)
+        << "Recovered resources '" << totalResources << "' and "
+        << operations.size() << " operations for resource provider with type '"
+        << info.type() << "' and name '" << info.name() << "'";
 
       state = DISCONNECTED;
 
@@ -710,39 +736,93 @@ Future<Nothing>
 StorageLocalResourceProviderProcess::reconcileResourceProviderState()
 {
   return reconcileOperationStatuses()
-    .then(defer(self(), [=] {
-      return collect<Resources>({getRawVolumes(), getStoragePools()})
-        .then(defer(self(), [=](const vector<Resources>& discovered) {
-          ResourceConversion conversion = reconcileResources(
-              totalResources,
-              accumulate(discovered.begin(), discovered.end(), Resources()));
+    .then(defer(self(), &Self::reconcileResources, true))
+    .then(defer(self(), [this] {
+      statusUpdateManager.resume();
 
-          Try<Resources> result = totalResources.apply(conversion);
-          CHECK_SOME(result);
-
-          if (result.get() != totalResources) {
-            LOG(INFO)
-              << "Removing '" << conversion.consumed << "' and adding '"
-              << conversion.converted << "' to the total resources";
-
-            totalResources = result.get();
-            checkpointResourceProviderState();
-          }
-
-          // NOTE: Since this is the first `UPDATE_STATE` call of the
-          // current subscription, there must be no racing speculative
-          // operation, thus no need to update the resource version.
-          sendResourceProviderStateUpdate();
-          statusUpdateManager.resume();
-
-          LOG(INFO)
-            << "Resource provider " << info.id() << " is in READY state";
+      switch (state) {
+        case RECOVERING:
+        case DISCONNECTED:
+        case CONNECTED:
+        case SUBSCRIBED: {
+          LOG(INFO) << "Resource provider " << info.id()
+                    << " is in READY state";
 
           state = READY;
+        }
+        case READY:
+          break;
+      }
+
+      return Nothing();
+    }));
+}
+
+
+void StorageLocalResourceProviderProcess::watchResources()
+{
+  // A specified reconciliation interval of zero
+  // denotes disabled periodic reconciliations.
+  if (reconciliationInterval == Seconds(0)) {
+    return;
+  }
+
+  CHECK(info.has_id());
+
+  loop(
+      self(),
+      std::bind(&process::after, reconciliationInterval),
+      [this](const Nothing&) {
+        // Poll resource provider state in `sequence` to
+        // prevent concurrent non-reconcilable operations.
+        reconciled = sequence.add(std::function<Future<Nothing>()>(
+            defer(self(), &Self::reconcileResources, false)));
+
+        return reconciled.then(
+            [](const Nothing&) -> ControlFlow<Nothing> { return Continue(); });
+      });
+}
+
+
+Future<Nothing> StorageLocalResourceProviderProcess::reconcileResources(
+    bool alwaysUpdate)
+{
+  LOG(INFO) << "Reconciling storage pools and volumes";
+
+  CHECK_PENDING(reconciled);
+
+  return collect<vector<ResourceConversion>>(
+             {getExistingVolumes(), getStoragePools()})
+    .then(defer(
+        self(),
+        [alwaysUpdate, this]
+        (const vector<vector<ResourceConversion>>& collected) {
+          Resources result = totalResources;
+          foreach (const vector<ResourceConversion>& conversions, collected) {
+            result = CHECK_NOTERROR(result.apply(conversions));
+          }
+
+          bool shouldSendUpdate = alwaysUpdate;
+
+          if (result != totalResources) {
+            LOG(INFO) << "Removing '" << (totalResources - result)
+                      << "' and adding '" << (result - totalResources)
+                      << "' to the total resources";
+
+            // Update the resource version since the total resources changed.
+            totalResources = result;
+
+            checkpointResourceProviderState();
+
+            shouldSendUpdate = true;
+          }
+
+          if (shouldSendUpdate) {
+            sendResourceProviderStateUpdate();
+          }
 
           return Nothing();
         }));
-    }));
 }
 
 
@@ -907,50 +987,6 @@ StorageLocalResourceProviderProcess::reconcileOperationStatuses()
 }
 
 
-Future<Nothing> StorageLocalResourceProviderProcess::reconcileStoragePools()
-{
-  CHECK_PENDING(reconciled);
-
-  auto die = [=](const string& message) {
-    LOG(ERROR)
-      << "Failed to reconcile storage pools for resource provider " << info.id()
-      << ": " << message;
-    fatal();
-  };
-
-  return getStoragePools()
-    .then(defer(self(), [=](const Resources& discovered) {
-      ResourceConversion conversion = reconcileResources(
-          totalResources.filter(
-              [](const Resource& r) { return !r.disk().source().has_id(); }),
-          discovered);
-
-      Try<Resources> result = totalResources.apply(conversion);
-      CHECK_SOME(result);
-
-      if (result.get() != totalResources) {
-        LOG(INFO)
-          << "Removing '" << conversion.consumed << "' and adding '"
-          << conversion.converted << "' to the total resources";
-
-        totalResources = result.get();
-        checkpointResourceProviderState();
-
-        // NOTE: We always update the resource version before sending
-        // an `UPDATE_STATE`, so that any racing speculative operation
-        // will be rejected. Otherwise, the speculative resource
-        // conversion done on the master will be cancelled out.
-        resourceVersion = id::UUID::random();
-        sendResourceProviderStateUpdate();
-      }
-
-      return Nothing();
-    }))
-    .onFailed(defer(self(), std::bind(die, lambda::_1)))
-    .onDiscarded(defer(self(), std::bind(die, "future discarded")));
-}
-
-
 bool StorageLocalResourceProviderProcess::allowsReconciliation(
     const Offer::Operation& operation)
 {
@@ -991,9 +1027,8 @@ bool StorageLocalResourceProviderProcess::allowsReconciliation(
 }
 
 
-ResourceConversion StorageLocalResourceProviderProcess::reconcileResources(
-    const Resources& checkpointed,
-    const Resources& discovered)
+ResourceConversion StorageLocalResourceProviderProcess::computeConversion(
+    const Resources& checkpointed, const Resources& discovered) const
 {
   // NOTE: If a resource in the checkpointed resources is missing in the
   // discovered resources, we will still keep it if it is converted by
@@ -1007,7 +1042,7 @@ ResourceConversion StorageLocalResourceProviderProcess::reconcileResources(
   Resources toAdd = discovered;
 
   foreach (const Resource& resource, checkpointed) {
-    Resource unconverted = createRawDiskResource(
+    Resources unconverted = createRawDiskResource(
         info,
         Bytes(resource.scalar().value() * Bytes::MEGABYTES),
         resource.disk().source().has_profile()
@@ -1024,7 +1059,7 @@ ResourceConversion StorageLocalResourceProviderProcess::reconcileResources(
       // "unconverted" version of a checkpointed resource, this is not a
       // new resource.
       toAdd -= unconverted;
-    } else if (checkpointed.contains(unconverted)) {
+    } else if (unconverted == resource) {
       // If the remaining of the discovered resources does not contain
       // the "unconverted" version of the checkpointed resource, the
       // resource is missing. However, if it remains unconverted in the
@@ -1041,68 +1076,144 @@ ResourceConversion StorageLocalResourceProviderProcess::reconcileResources(
 }
 
 
-Future<Resources> StorageLocalResourceProviderProcess::getRawVolumes()
+Future<vector<ResourceConversion>>
+StorageLocalResourceProviderProcess::getExistingVolumes()
 {
   CHECK(info.has_id());
 
   return volumeManager->listVolumes()
     .then(defer(self(), [=](const vector<VolumeInfo>& volumeInfos) {
-      Resources resources;
+      // If a volume is duplicated or a volume context has been changed by a
+      // non-conforming CSI plugin, we need to construct a resources conversion
+      // to remove the duplicate and update the metadata, so we maintain the
+      // resources to be removed and those to be added here.
+      Resources toRemove;
+      Resources toAdd;
 
-      // Recover disk profiles from the checkpointed state.
-      hashmap<string, string> volumesToProfiles;
+      // Since we only support "exclusive" (MOUNT or BLOCK) disks, there should
+      // be only one checkpointed resource for each volume ID.
+      hashmap<string, Resource> checkpointedMap;
       foreach (const Resource& resource, totalResources) {
-        if (resource.disk().source().has_id() &&
-            resource.disk().source().has_profile()) {
-          volumesToProfiles.put(
-              resource.disk().source().id(),
-              resource.disk().source().profile());
+        if (resource.disk().source().has_id()) {
+          // If the checkpointed resources contain duplicated volumes because of
+          // a non-conforming CSI plugin, remove the duplicate.
+          if (checkpointedMap.contains(resource.disk().source().id())) {
+            LOG(WARNING) << "Removing duplicated volume '" << resource
+                         << "' from the total resources";
+
+            toRemove += resource;
+          } else {
+            checkpointedMap.put(resource.disk().source().id(), resource);
+          }
         }
       }
 
+      // The "discovered" resources consist of RAW disk resources, one for each
+      // volume reported by the CSI plugin.
+      Resources discovered;
+      hashset<string> discoveredVolumeIds;
+
       foreach (const VolumeInfo& volumeInfo, volumeInfos) {
-        resources += createRawDiskResource(
+        const Option<string> profile =
+          checkpointedMap.contains(volumeInfo.id) &&
+          checkpointedMap.at(volumeInfo.id).disk().source().has_profile()
+            ? checkpointedMap.at(volumeInfo.id).disk().source().profile()
+            : Option<string>::none();
+
+        const Option<Labels> metadata = volumeInfo.context.empty()
+          ? Option<Labels>::none()
+          : convertStringMapToLabels(volumeInfo.context);
+
+        const Resource resource = createRawDiskResource(
             info,
             volumeInfo.capacity,
-            volumesToProfiles.contains(volumeInfo.id)
-              ? volumesToProfiles.at(volumeInfo.id)
-              : Option<string>::none(),
+            profile,
             vendor,
             volumeInfo.id,
-            volumeInfo.context.empty()
-              ? Option<Labels>::none()
-              : convertStringMapToLabels(volumeInfo.context));
+            metadata);
+
+        if (discoveredVolumeIds.contains(volumeInfo.id)) {
+          LOG(WARNING) << "Dropping duplicated volume '" << resource
+                       << "' from the discovered resources";
+
+          continue;
+        }
+
+        discovered += resource;
+        discoveredVolumeIds.insert(volumeInfo.id);
+
+        if (checkpointedMap.contains(volumeInfo.id)) {
+          const Resource& resource = checkpointedMap.at(volumeInfo.id);
+
+          // If the volume context has been changed by a non-conforming CSI
+          // plugin, the changes will be reflected in a resource conversion.
+          if (resource.disk().source().metadata() !=
+              metadata.getOrElse(Labels())) {
+            toRemove += resource;
+
+            Resource changed = resource;
+            if (metadata.isSome()) {
+              *changed.mutable_disk()->mutable_source()->mutable_metadata() =
+                *metadata;
+            } else {
+              changed.mutable_disk()->mutable_source()->clear_metadata();
+            }
+
+            toAdd += changed;
+          }
+        }
       }
 
-      return resources;
+      ResourceConversion metadataConversion(
+          std::move(toRemove), std::move(toAdd));
+
+      Resources checkpointed = CHECK_NOTERROR(
+          totalResources.filter([](const Resource& resource) {
+            return resource.disk().source().has_id();
+          }).apply(metadataConversion));
+
+      return vector<ResourceConversion>{
+        std::move(metadataConversion),
+        computeConversion(std::move(checkpointed), std::move(discovered))};
     }));
 }
 
 
-Future<Resources> StorageLocalResourceProviderProcess::getStoragePools()
+Future<vector<ResourceConversion>>
+StorageLocalResourceProviderProcess::getStoragePools()
 {
   CHECK(info.has_id());
 
-  vector<Future<Resources>> futures;
+  vector<Future<Resource>> futures;
 
   foreachpair (const string& profile,
                const DiskProfileAdaptor::ProfileInfo& profileInfo,
                profileInfos) {
-    futures.push_back(volumeManager->getCapacity(
-        profileInfo.capability, profileInfo.parameters)
-      .then(defer(self(), [=](const Bytes& capacity) -> Resources {
-        if (capacity == 0) {
-          return Resources();
-        }
-
-        return createRawDiskResource(info, capacity, profile, vendor);
-      })));
+    futures.push_back(
+        volumeManager->getCapacity(
+            profileInfo.capability, profileInfo.parameters)
+          .then(std::bind(
+              &createRawDiskResource,
+              info,
+              lambda::_1,
+              profile,
+              vendor,
+              None(),
+              None())));
   }
 
   return collect(futures)
-    .then([](const vector<Resources>& resources) {
-      return accumulate(resources.begin(), resources.end(), Resources());
-    });
+    .then(defer(self(), [=](const vector<Resource>& resources) {
+      Resources discovered(resources); // Zero resources will be ignored.
+      Resources checkpointed =
+        totalResources.filter([](const Resource& resource) {
+          return Resources::isDisk(resource, Resource::DiskInfo::Source::RAW) &&
+            !resource.disk().source().has_id();
+        });
+
+      return vector<ResourceConversion>{
+        computeConversion(std::move(checkpointed), std::move(discovered))};
+    }));
 }
 
 
@@ -1127,7 +1238,7 @@ void StorageLocalResourceProviderProcess::watchProfiles()
 
         std::function<Future<Nothing>()> update = defer(self(), [=] {
           return updateProfiles(profiles)
-            .then(defer(self(), &Self::reconcileStoragePools));
+            .then(defer(self(), &Self::reconcileResources, false));
         });
 
         // Update the profile mapping and storage pools in `sequence` to wait
@@ -1220,10 +1331,12 @@ void StorageLocalResourceProviderProcess::subscribed(
   // Reconcile resources after obtaining the resource provider ID and start
   // watching for profile changes after the reconciliation.
   // TODO(chhsiao): Reconcile and watch for profile changes early.
-  reconciled = reconcileResourceProviderState()
-    .onReady(defer(self(), &Self::watchProfiles))
-    .onFailed(defer(self(), std::bind(die, lambda::_1)))
-    .onDiscarded(defer(self(), std::bind(die, "future discarded")));
+  reconciled =
+    reconcileResourceProviderState()
+      .onReady(defer(self(), &Self::watchProfiles))
+      .onReady(defer(self(), &Self::watchResources))
+      .onFailed(defer(self(), std::bind(die, lambda::_1)))
+      .onDiscarded(defer(self(), std::bind(die, "future discarded")));
 }
 
 
@@ -1687,7 +1800,7 @@ StorageLocalResourceProviderProcess::applyCreateDisk(
 
   // TODO(chhsiao): Consider calling `createVolume` sequentially with other
   // create or delete operations, and send an `UPDATE_STATE` for storage pools
-  // afterward. See MESOS-9254.
+  // afterward.
   Future<VolumeInfo> created;
   if (resource.disk().source().has_profile()) {
     created = volumeManager->createVolume(
@@ -1816,8 +1929,18 @@ StorageLocalResourceProviderProcess::applyDestroyDisk(
             // pending operation that disallow reconciliation to finish, and set
             // up `reconciled` to drop incoming operations that disallow
             // reconciliation until the storage pools are reconciled.
-            reconciled = sequence.add(std::function<Future<Nothing>()>(
-                defer(self(), &Self::reconcileStoragePools)));
+            auto err = [](const Resource& resource, const string& message) {
+              LOG(ERROR)
+                << "Failed to reconcile storage pools after resource "
+                << "'" << resource << "' has been freed: " << message;
+            };
+
+            reconciled =
+              sequence
+                .add(std::function<Future<Nothing>()>(
+                    defer(self(), &Self::reconcileResources, false)))
+                .onFailed(std::bind(err, resource, lambda::_1))
+                .onDiscard(std::bind(err, resource, "future discarded"));
           }
         }
       } else {
@@ -2072,6 +2195,12 @@ void StorageLocalResourceProviderProcess::checkpointResourceProviderState()
 
 void StorageLocalResourceProviderProcess::sendResourceProviderStateUpdate()
 {
+  // Set a new resource version here since we typically send state
+  // updates when resources change. While this ensures we always have
+  // a new resource version whenever we set new state, with that this
+  // function is not idempotent anymore.
+  resourceVersion = id::UUID::random();
+
   Call call;
   call.set_type(Call::UPDATE_STATE);
   call.mutable_resource_provider_id()->CopyFrom(info.id());

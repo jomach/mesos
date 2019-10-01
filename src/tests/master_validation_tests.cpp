@@ -4763,6 +4763,43 @@ TEST_F(FrameworkInfoValidationTest, ValidateOfferFilters)
 }
 
 
+// This tests validation of FrameworkInfo updates.
+TEST_F(FrameworkInfoValidationTest, ValidateUpdate)
+{
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    frameworkInfo.add_roles("bar");
+
+    EXPECT_NONE(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    *frameworkInfo.mutable_principal() += "_foo";
+
+    EXPECT_SOME(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    *frameworkInfo.mutable_user() += "_foo";
+
+    EXPECT_SOME(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    frameworkInfo.set_checkpoint(!frameworkInfo.checkpoint());
+
+    EXPECT_SOME(framework::validateUpdate(
+        DEFAULT_FRAMEWORK_INFO, frameworkInfo));
+  }
+}
+
+
 // This test ensures that ia framework cannot use the
 // `FrameworkInfo.roles` field without providing the
 // MULTI_ROLE capability.

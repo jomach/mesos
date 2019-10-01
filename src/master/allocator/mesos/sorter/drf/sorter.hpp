@@ -14,8 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef __MASTER_ALLOCATOR_SORTER_DRF_SORTER_HPP__
-#define __MASTER_ALLOCATOR_SORTER_DRF_SORTER_HPP__
+#ifndef __MASTER_ALLOCATOR_MESOS_SORTER_DRF_SORTER_HPP__
+#define __MASTER_ALLOCATOR_MESOS_SORTER_DRF_SORTER_HPP__
 
 #include <algorithm>
 #include <set>
@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <mesos/mesos.hpp>
+#include <mesos/resource_quantities.hpp>
 #include <mesos/resources.hpp>
 #include <mesos/values.hpp>
 
@@ -30,11 +31,9 @@
 #include <stout/hashmap.hpp>
 #include <stout/option.hpp>
 
-#include "common/resource_quantities.hpp"
+#include "master/allocator/mesos/sorter/drf/metrics.hpp"
 
-#include "master/allocator/sorter/drf/metrics.hpp"
-
-#include "master/allocator/sorter/sorter.hpp"
+#include "master/allocator/mesos/sorter/sorter.hpp"
 
 
 namespace mesos {
@@ -90,9 +89,6 @@ public:
       const std::string& clientPath) const override;
   const ResourceQuantities& allocationScalarQuantities()
       const override;
-
-  hashmap<std::string, Resources> allocation(
-      const SlaveID& slaveId) const override;
 
   Resources allocation(
       const std::string& clientPath,
@@ -265,7 +261,7 @@ struct DRFSorter::Node
   // (virtual leaf), and "a/b". The `clientPath()` of "a/." is "a",
   // because that is the name of the client associated with that
   // virtual leaf node.
-  std::string clientPath() const
+  const std::string& clientPath() const
   {
     if (name == ".") {
       CHECK(kind == ACTIVE_LEAF || kind == INACTIVE_LEAF);
@@ -360,7 +356,7 @@ struct DRFSorter::Node
 
       totals -= quantitiesToRemove;
 
-      if (resources[slaveId].empty()) {
+      if (resources.at(slaveId).empty()) {
         resources.erase(slaveId);
       }
     }
@@ -385,6 +381,12 @@ struct DRFSorter::Node
 
       resources[slaveId] -= oldAllocation;
       resources[slaveId] += newAllocation;
+
+      // It is possible that allocations can be updated to empty.
+      // See MESOS-9015 and MESOS-9975.
+      if (resources.at(slaveId).empty()) {
+        resources.erase(slaveId);
+      }
 
       totals -= oldAllocationQuantities;
       totals += newAllocationQuantities;
@@ -432,4 +434,4 @@ struct DRFSorter::Node
 } // namespace internal {
 } // namespace mesos {
 
-#endif // __MASTER_ALLOCATOR_SORTER_DRF_SORTER_HPP__
+#endif // __MASTER_ALLOCATOR_MESOS_SORTER_DRF_SORTER_HPP__

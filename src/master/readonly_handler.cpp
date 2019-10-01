@@ -96,11 +96,15 @@ struct SlaveWriter
 {
   SlaveWriter(
       const Slave& slave,
+      const Option<DrainInfo>& drainInfo,
+      bool deactivated,
       const process::Owned<ObjectApprovers>& approvers);
 
   void operator()(JSON::ObjectWriter* writer) const;
 
   const Slave& slave_;
+  const Option<DrainInfo> drainInfo_;
+  const bool deactivated_;
   const process::Owned<ObjectApprovers>& approvers_;
 };
 
@@ -285,8 +289,13 @@ void FullFrameworkWriter::operator()(JSON::ObjectWriter* writer) const
 
 SlaveWriter::SlaveWriter(
     const Slave& slave,
+    const Option<DrainInfo>& drainInfo,
+    bool deactivated,
     const Owned<ObjectApprovers>& approvers)
-  : slave_(slave), approvers_(approvers)
+  : slave_(slave),
+    drainInfo_(drainInfo),
+    deactivated_(deactivated),
+    approvers_(approvers)
 {}
 
 
@@ -321,8 +330,19 @@ void SlaveWriter::operator()(JSON::ObjectWriter* writer) const
   writer->field("unreserved_resources", totalResources.unreserved());
 
   writer->field("active", slave_.active);
+  writer->field("deactivated", deactivated_);
   writer->field("version", slave_.version);
   writer->field("capabilities", slave_.capabilities.toRepeatedPtrField());
+
+  if (drainInfo_.isSome()) {
+    writer->field("drain_info", JSON::Protobuf(drainInfo_.get()));
+
+    if (slave_.estimatedDrainStartTime.isSome()) {
+      writer->field(
+          "estimated_drain_start_time_seconds",
+          slave_.estimatedDrainStartTime->secs());
+    }
+  }
 }
 
 
@@ -365,7 +385,11 @@ void SlavesWriter::operator()(JSON::ObjectWriter* writer) const
 void SlavesWriter::writeSlave(
   const Slave* slave, JSON::ObjectWriter* writer) const
 {
-  SlaveWriter(*slave, approvers_)(writer);
+  SlaveWriter(
+      *slave,
+      slaves_.draining.get(slave->id),
+      slaves_.deactivated.contains(slave->id),
+      approvers_)(writer);
 
   // Add the complete protobuf->JSON for all used, reserved,
   // and offered resources. The other endpoints summarize
@@ -694,82 +718,80 @@ process::http::Response Master::ReadOnlyHandler::frameworks(
 }
 
 
-// Returns a JSON object modeled after a role.
-JSON::Object model(
-    const string& name,
-    Option<double> weight,
-    Option<Quota> quota,
-    Option<Role*> _role)
-{
-  JSON::Object object;
-  object.values["name"] = name;
-
-  if (weight.isSome()) {
-    object.values["weight"] = weight.get();
-  } else {
-    object.values["weight"] = 1.0; // Default weight.
-  }
-
-  if (quota.isSome()) {
-    object.values["quota"] = model(quota->info);
-  }
-
-  if (_role.isNone()) {
-    object.values["resources"] = model(Resources());
-    object.values["frameworks"] = JSON::Array();
-  } else {
-    Role* role = _role.get();
-
-    object.values["resources"] = model(role->allocatedResources());
-
-    {
-      JSON::Array array;
-
-      foreachkey (const FrameworkID& frameworkId, role->frameworks) {
-        array.values.push_back(frameworkId.value());
-      }
-
-      object.values["frameworks"] = std::move(array);
-    }
-  }
-
-  return object;
-}
-
-
 process::http::Response Master::ReadOnlyHandler::roles(
     const hashmap<std::string, std::string>& query,
     const process::Owned<ObjectApprovers>& approvers) const
 {
-  JSON::Object object;
-  const vector<string> filteredRoles = master->filterRoles(approvers);
+  const Master* master = this->master;
 
-  {
-    JSON::Array array;
+  const vector<string> knownRoles = master->knownRoles();
 
-    foreach (const string& name, filteredRoles) {
-      Option<double> weight = None();
-      if (master->weights.contains(name)) {
-        weight = master->weights.at(name);
-      }
+  auto roles = [&](JSON::ObjectWriter* writer) {
+    writer->field(
+        "roles",
+        [&](JSON::ArrayWriter* writer) {
+          foreach (const string& name, knownRoles) {
+            if (!approvers->approved<VIEW_ROLE>(name)) {
+              continue;
+            }
 
-      Option<Quota> quota = None();
-      if (master->quotas.contains(name)) {
-        quota = master->quotas.at(name);
-      }
+            writer->element([&](JSON::ObjectWriter* writer) {
+              writer->field("name", name);
 
-      Option<Role*> role = None();
-      if (master->roles.contains(name)) {
-        role = master->roles.at(name);
-      }
+              writer->field(
+                  "weight",
+                  master->weights.get(name).getOrElse(DEFAULT_WEIGHT));
 
-      array.values.push_back(model(name, weight, quota, role));
-    }
+              Option<Role*> role = master->roles.get(name);
 
-    object.values["roles"] = std::move(array);
-  }
+              RoleResourceBreakdown resourceBreakdown(master, name);
 
-  return OK(object, query.get("jsonp"));
+              // Prior to Mesos 1.9, this field is filled based on
+              // `QuotaInfo` which is now deprecated. For backward
+              // compatibility reasons, we do not use any formatter
+              // for the new struct but construct the response by hand.
+              // Specifically:
+              //
+              //  - We keep the `role` field which was present in the
+              //    `QuotaInfo`.
+              //
+              //  - We name the field using singular `guarantee` and `limit`
+              //    which is different from the plural used in `QuotaConfig`.
+              const Quota quota = master->quotas.get(name).getOrElse(Quota());
+
+              writer->field("quota", [&](JSON::ObjectWriter* writer) {
+                writer->field("role", name);
+
+                writer->field("guarantee", quota.guarantees);
+                writer->field("limit", quota.limits);
+                writer->field("consumed", resourceBreakdown.consumedQuota());
+              });
+
+              ResourceQuantities allocated = resourceBreakdown.allocated();
+              ResourceQuantities offered = resourceBreakdown.offered();
+
+              // Deprecated by allocated, offered, reserved.
+              writer->field("resources", allocated + offered);
+
+              writer->field("allocated", allocated);
+              writer->field("offered", offered);
+              writer->field("reserved", resourceBreakdown.reserved());
+
+              if (role.isNone()) {
+                writer->field("frameworks", [](JSON::ArrayWriter*) {});
+              } else {
+                writer->field("frameworks", [&](JSON::ArrayWriter* writer) {
+                  foreachkey (const FrameworkID& id, (*role)->frameworks) {
+                    writer->element(id.value());
+                  }
+                });
+              }
+            });
+          }
+        });
+  };
+
+  return OK(jsonify(roles), query.get("jsonp"));
 }
 
 
@@ -866,7 +888,11 @@ process::http::Response Master::ReadOnlyHandler::state(
         "slaves",
         [master, &approvers](JSON::ArrayWriter* writer) {
           foreachvalue (Slave* slave, master->slaves.registered) {
-            writer->element(SlaveWriter(*slave, approvers));
+            writer->element(SlaveWriter(
+                *slave,
+                master->slaves.draining.get(slave->id),
+                master->slaves.deactivated.contains(slave->id),
+                approvers));
           }
         });
 
@@ -965,10 +991,15 @@ process::http::Response Master::ReadOnlyHandler::stateSummary(
           foreachvalue (Slave* slave, master->slaves.registered) {
             writer->element(
                 [&slave,
+                 &master,
                  &slaveFrameworkMapping,
                  &taskStateSummaries,
                  &approvers](JSON::ObjectWriter* writer) {
-                  SlaveWriter slaveWriter(*slave, approvers);
+                  SlaveWriter slaveWriter(
+                      *slave,
+                      master->slaves.draining.get(slave->id),
+                      master->slaves.deactivated.contains(slave->id),
+                      approvers);
                   slaveWriter(writer);
 
                   // Add the 'TaskState' summary for this slave.

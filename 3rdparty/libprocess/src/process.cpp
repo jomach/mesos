@@ -150,6 +150,10 @@ using process::network::inet::Socket;
 
 using process::network::internal::SocketImpl;
 
+#ifdef USE_SSL_SOCKET
+using process::network::openssl::create_tls_client_config;
+#endif
+
 using std::deque;
 using std::find;
 using std::list;
@@ -369,13 +373,15 @@ public:
       const Socket& socket,
       Request* request);
 
+  // Returns whether the event was delivered to the destination's
+  // queue. This function takes ownership over `event` and will
+  // delete it if it was not delivered.
   bool deliver(
-      ProcessBase* receiver,
+      ProcessBase* destination,
       Event* event,
       ProcessBase* sender = nullptr);
-
   bool deliver(
-      const UPID& to,
+      const UPID& destination,
       Event* event,
       ProcessBase* sender = nullptr);
 
@@ -403,7 +409,7 @@ public:
   void settle();
 
   // The /__processes__ route.
-  Future<Response> __processes__(const Request&);
+  Future<Response> __processes__(const Request& request);
 
   void install(Filter* f)
   {
@@ -424,6 +430,8 @@ public:
   }
 
 private:
+  bool _deliver(ProcessBase* destination, Event* event, ProcessBase* sender);
+
   // Delegate process name to receive root HTTP requests.
   const Option<string> delegate;
 
@@ -1439,6 +1447,25 @@ void ignore_recv_data(
 // Forward declaration.
 void send(Encoder* encoder, Socket socket);
 
+// A helper to securely select the correct overload of `connect()`
+// for a generic socket.
+Future<Nothing> connectSocket(
+    Socket& socket,
+    const Address& address,
+    const Option<string>& servername)
+{
+  switch (socket.kind()) {
+    case SocketImpl::Kind::POLL:
+      return socket.connect(address);
+#ifdef USE_SSL_SOCKET
+    case SocketImpl::Kind::SSL:
+      return socket.connect(
+          address, create_tls_client_config(servername));
+#endif
+  }
+
+  UNREACHABLE();
+}
 
 } // namespace internal {
 
@@ -1591,7 +1618,7 @@ void SocketManager::link(
           // for the linkee. At this point, we have not passed ownership of
           // this socket to the `SocketManager`, so there is only one possible
           // linkee to notify.
-          process->enqueue(new ExitedEvent(to));
+          process_manager->deliver(process, new ExitedEvent(to));
           return;
         }
         socket = create.get();
@@ -1624,7 +1651,7 @@ void SocketManager::link(
           // for the linkee. At this point, we have not passed ownership of
           // this socket to the `SocketManager`, so there is only one possible
           // linkee to notify.
-          process->enqueue(new ExitedEvent(to));
+          process_manager->deliver(process, new ExitedEvent(to));
           return;
         }
 
@@ -1667,7 +1694,7 @@ void SocketManager::link(
 
   if (connect) {
     CHECK_SOME(socket);
-    socket->connect(to.address)
+    internal::connectSocket(*socket, to.address, to.host)
       .onAny(lambda::bind(
           &SocketManager::link_connect,
           this,
@@ -2029,7 +2056,7 @@ void SocketManager::send(Message&& message, const SocketImpl::Kind& kind)
 
   if (connect) {
     CHECK_SOME(socket);
-    socket->connect(address)
+    internal::connectSocket(*socket, address, message.to.host)
       .onAny(lambda::bind(
             // TODO(benh): with C++14 we can use lambda instead of
             // `std::bind` and capture `message` with a `std::move`.
@@ -2260,7 +2287,7 @@ void SocketManager::exited(const Address& address)
       CHECK(links.linkers.contains(linkee));
 
       foreach (ProcessBase* linker, links.linkers[linkee]) {
-        linker->enqueue(new ExitedEvent(linkee));
+        process_manager->deliver(linker, new ExitedEvent(linkee));
 
         // Remove the linkee pid from the linker.
         CHECK(links.linkees.contains(linker));
@@ -2327,7 +2354,7 @@ void SocketManager::exited(ProcessBase* process)
     foreach (ProcessBase* linker, links.linkers[pid]) {
       CHECK(linker != process) << "Process linked with itself";
       Clock::update(linker, time);
-      linker->enqueue(new ExitedEvent(pid));
+      process_manager->deliver(linker, new ExitedEvent(pid));
 
       // Remove the linkee pid from the linker.
       CHECK(links.linkees.contains(linker));
@@ -2766,7 +2793,48 @@ void ProcessManager::handle(
 
 
 bool ProcessManager::deliver(
-    ProcessBase* receiver,
+    ProcessBase* destination,
+    Event* event,
+    ProcessBase* sender)
+{
+  CHECK(event != nullptr);
+
+  if (_deliver(destination, event, sender)) {
+    return true;
+  }
+
+  delete event;
+  return false;
+}
+
+
+bool ProcessManager::deliver(
+    const UPID& destination,
+    Event* event,
+    ProcessBase* sender)
+{
+  CHECK(event != nullptr);
+
+  if (ProcessReference reference = use(destination)) {
+    if (_deliver(reference, event, sender)) {
+      return true;
+    }
+  } else {
+    VLOG(2) << "Dropping event for process " << destination;
+  }
+
+  // Note that we must delete the event without holding the
+  // process reference, since deletion of a dispatch event
+  // may invoke other code via destructors of objects bound
+  // into the dispatched function and therefore can lead to
+  // deadlock. An example of such a deadlock is in MESOS-9808.
+  delete event;
+  return false;
+}
+
+
+bool ProcessManager::_deliver(
+    ProcessBase* destination,
     Event* event,
     ProcessBase* sender)
 {
@@ -2780,30 +2848,10 @@ bool ProcessManager::deliver(
   // time).
   if (Clock::paused()) {
     Clock::update(
-        receiver, Clock::now(sender != nullptr ? sender : __process__));
+        destination, Clock::now(sender != nullptr ? sender : __process__));
   }
 
-  receiver->enqueue(event);
-
-  return true;
-}
-
-
-bool ProcessManager::deliver(
-    const UPID& to,
-    Event* event,
-    ProcessBase* sender)
-{
-  CHECK(event != nullptr);
-
-  if (ProcessReference receiver = use(to)) {
-    return deliver(receiver, event, sender);
-  }
-
-  VLOG(2) << "Dropping event for process " << to;
-
-  delete event;
-  return false;
+  return destination->enqueue(event);
 }
 
 
@@ -3141,7 +3189,7 @@ void ProcessManager::link(
     } else {
       // Since the pid isn't valid its process must have already died
       // (or hasn't been spawned yet) so send a process exit message.
-      process->enqueue(new ExitedEvent(to));
+      process_manager->deliver(process, new ExitedEvent(to));
     }
   }
 }
@@ -3158,11 +3206,11 @@ void ProcessManager::terminate(
           process, Clock::now(sender != nullptr ? sender : __process__));
     }
 
-    if (sender != nullptr) {
-      process->enqueue(new TerminateEvent(sender->self(), inject));
-    } else {
-      process->enqueue(new TerminateEvent(UPID(), inject));
-    }
+    process_manager->deliver(
+        process,
+        new TerminateEvent(
+            sender != nullptr ? sender->self() : UPID(),
+            inject));
   }
 }
 
@@ -3387,7 +3435,7 @@ void ProcessManager::settle()
 }
 
 
-Future<Response> ProcessManager::__processes__(const Request&)
+Future<Response> ProcessManager::__processes__(const Request& request)
 {
   synchronized (processes_mutex) {
     return collect(lambda::map(
@@ -3396,17 +3444,38 @@ Future<Response> ProcessManager::__processes__(const Request&)
           // high-priority set of events (i.e., mailbox).
           return dispatch(
               process->self(),
-              [process]() -> JSON::Object {
-                return *process;
-              });
+              [process]() -> Option<JSON::Object> {
+                return Option<JSON::Object>(*process);
+              })
+            // We must recover abandoned futures in case
+            // the process is terminated and the dispatch
+            // is dropped.
+            .recover([](const Future<Option<JSON::Object>>& f) {
+              return Option<JSON::Object>::none();
+            });
         },
         process_manager->processes.values()))
-      .then([](const std::vector<JSON::Object>& objects) -> Response {
+      .then([request](
+          const std::vector<Option<JSON::Object>>& objects) -> Response {
         JSON::Array array;
-        foreach (const JSON::Object& object, objects) {
-          array.values.push_back(object);
+        foreach (const Option<JSON::Object>& object, objects) {
+          if (object.isSome()) {
+            array.values.push_back(*object);
+          }
         }
-        return OK(array);
+
+        Response response = OK(array);
+
+        // TODO(alexr): Generalize response logging in libprocess.
+        VLOG(1) << "HTTP " << request.method << " for " << request.url
+                << (request.client.isSome()
+                    ? " from " + stringify(request.client.get())
+                    : "")
+                << ": '" << response.status << "'"
+                << " after " << (process::Clock::now() - request.received).ms()
+                << Milliseconds::units();
+
+        return response;
       });
   }
 }
@@ -3479,7 +3548,7 @@ size_t ProcessBase::eventCount<TerminateEvent>()
 }
 
 
-void ProcessBase::enqueue(Event* event)
+bool ProcessBase::enqueue(Event* event)
 {
   CHECK_NOTNULL(event);
 
@@ -3492,15 +3561,27 @@ void ProcessBase::enqueue(Event* event)
     event->is<TerminateEvent>() &&
     event->as<TerminateEvent>().inject;
 
+  bool enqueued = false;
+
   switch (old) {
     case State::BOTTOM:
     case State::READY:
     case State::BLOCKED:
-      events->producer.enqueue(event);
+      enqueued = events->producer.enqueue(event);
       break;
     case State::TERMINATING:
-      delete event;
-      return;
+      break;
+  }
+
+  // NOTE: It's the responsibility of the caller to delete the
+  // undelivered event. This is by design since the destruction
+  // of a dispatch event may invoke other code. Therefore, if
+  // the caller is holding a `ProcessReference` to this process
+  // it must be cleared prior to deleting the dispatch event.
+  if (!enqueued) {
+    // TODO(bmahler): Log the type of event being dropped.
+    VLOG(2) << "Dropping event for TERMINATING process " << pid;
+    return false;
   }
 
   // We need to store terminate _AFTER_ we enqueue the event because
@@ -3526,6 +3607,8 @@ void ProcessBase::enqueue(Event* event)
       process_manager->enqueue(this);
     }
   }
+
+  return true;
 }
 
 

@@ -14,7 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "master/allocator/sorter/drf/sorter.hpp"
+#include "master/allocator/mesos/sorter/drf/sorter.hpp"
+#include "master/constants.hpp"
 
 #include <iterator>
 #include <set>
@@ -207,15 +208,14 @@ void DRFSorter::remove(const string& clientPath)
     }
 
     if (current->children.empty()) {
+      // Simply delete the current node if it has no children.
       parent->removeChild(current);
       delete current;
     } else if (current->children.size() == 1) {
-      // If `current` has only one child that was created to
-      // accommodate inserting `clientPath` (see `DRFSorter::add()`),
-      // we can remove the child node and turn `current` back into a
+      // If `current` has only one virtual node ".", we can collapse
+      // and remove that node, and turn `current` back into a
       // leaf node.
       Node* child = *(current->children.begin());
-
       if (child->name == ".") {
         CHECK(child->isLeaf());
         CHECK(clients.contains(current->path));
@@ -223,20 +223,16 @@ void DRFSorter::remove(const string& clientPath)
 
         current->kind = child->kind;
         current->removeChild(child);
+        delete child;
 
         // `current` has changed kind (from `INTERNAL` to a leaf,
-        // which might be active or inactive). Hence we might need to
-        // change its position in the `children` list.
-        if (current->kind == Node::INTERNAL) {
-          CHECK_NOTNULL(current->parent);
-
-          current->parent->removeChild(current);
-          current->parent->addChild(current);
-        }
+        // which might be active or inactive). We need to change
+        // its position in the `children` list.
+        CHECK_NOTNULL(current->parent);
+        current->parent->removeChild(current);
+        current->parent->addChild(current);
 
         clients[current->path] = current;
-
-        delete child;
       }
     }
 
@@ -432,32 +428,6 @@ const ResourceQuantities& DRFSorter::allocationScalarQuantities(
 const ResourceQuantities& DRFSorter::allocationScalarQuantities() const
 {
   return root->allocation.totals;
-}
-
-
-hashmap<string, Resources> DRFSorter::allocation(const SlaveID& slaveId) const
-{
-  hashmap<string, Resources> result;
-
-  // We want to find the allocation that has been made to each client
-  // on a particular `slaveId`. Rather than traversing the tree
-  // looking for leaf nodes (clients), we can instead just iterate
-  // over the `clients` hashmap.
-  //
-  // TODO(jmlvanre): We can index the allocation by slaveId to make
-  // this faster.  It is a tradeoff between speed vs. memory. For now
-  // we use existing data structures.
-  foreachvalue (const Node* client, clients) {
-    if (client->allocation.resources.contains(slaveId)) {
-      // It is safe to use `at()` here because we've just checked the
-      // existence of the key. This avoids unnecessary copies.
-      string path = client->clientPath();
-      CHECK(!result.contains(path));
-      result.emplace(path, client->allocation.resources.at(slaveId));
-    }
-  }
-
-  return result;
 }
 
 
@@ -659,7 +629,7 @@ double DRFSorter::calculateShare(const Node* node) const
 double DRFSorter::getWeight(const Node* node) const
 {
   if (node->weight.isNone()) {
-    node->weight = weights.get(node->path).getOrElse(1.0);
+    node->weight = weights.get(node->path).getOrElse(DEFAULT_WEIGHT);
   }
 
   return CHECK_NOTNONE(node->weight);

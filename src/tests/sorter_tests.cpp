@@ -25,16 +25,21 @@
 
 #include <stout/gtest.hpp>
 
-#include "master/allocator/sorter/drf/sorter.hpp"
+#include "master/allocator/mesos/sorter/drf/sorter.hpp"
 
-#include "master/allocator/sorter/random/sorter.hpp"
-#include "master/allocator/sorter/random/utils.hpp"
+#include "master/allocator/mesos/sorter/random/sorter.hpp"
+#include "master/allocator/mesos/sorter/random/utils.hpp"
 
+#include "master/allocator/mesos/hierarchical.hpp"
+
+#include "tests/allocator.hpp"
 #include "tests/mesos.hpp"
 #include "tests/resources_utils.hpp"
 
 using mesos::internal::master::allocator::DRFSorter;
 using mesos::internal::master::allocator::RandomSorter;
+
+using mesos::internal::master::allocator::internal::RoleTree;
 
 using std::cout;
 using std::endl;
@@ -732,14 +737,6 @@ TEST(DRFSorterTest, HierarchicalAllocation)
   EXPECT_EQ(vector<string>({"a", "b/d", "b/c"}), sorter.sort());
 
   {
-    hashmap<string, Resources> agentAllocation =
-      sorter.allocation(slaveId);
-
-    EXPECT_EQ(3u, agentAllocation.size());
-    EXPECT_EQ(aResources, agentAllocation.at("a"));
-    EXPECT_EQ(cResources, agentAllocation.at("b/c"));
-    EXPECT_EQ(dResources, agentAllocation.at("b/d"));
-
     EXPECT_EQ(aResources, sorter.allocation("a", slaveId));
     EXPECT_EQ(cResources, sorter.allocation("b/c", slaveId));
     EXPECT_EQ(dResources, sorter.allocation("b/d", slaveId));
@@ -1009,9 +1006,9 @@ TEST(DRFSorterTest, AddChildToInactiveLeaf)
 // This test checks what happens when a sorter client is removed,
 // which allows a leaf node to be collapsed into its parent node. This
 // is basically the inverse situation to `AddChildToLeaf`.
-TEST(DRFSorterTest, RemoveLeafCollapseParent)
+TYPED_TEST(CommonSorterTest, RemoveLeafCollapseParent)
 {
-  DRFSorter sorter;
+  TypeParam sorter;
 
   SlaveID slaveId;
   slaveId.set_value("agentId");
@@ -1033,20 +1030,30 @@ TEST(DRFSorterTest, RemoveLeafCollapseParent)
   sorter.allocated(
       "a/c", slaveId, Resources::parse("cpus:5;mem:5").get());
 
-  EXPECT_EQ(vector<string>({"b", "a/c", "a"}), sorter.sort());
+  // We sort the `sort()` output alphabetically here since we only
+  // want to verify the content of elements but not their order.
+  vector<string> clients = sorter.sort();
+  sort(clients.begin(), clients.end());
+
+  EXPECT_EQ(vector<string>({"a", "a/c", "b"}), clients);
 
   sorter.remove("a/c");
 
-  EXPECT_EQ(vector<string>({"b", "a"}), sorter.sort());
+  // We sort the `sort()` output alphabetically here since we only
+  // want to verify the content of elements but not their order.
+  clients = sorter.sort();
+  sort(clients.begin(), clients.end());
+
+  EXPECT_EQ(vector<string>({"a", "b"}), clients);
 }
 
 
 // This test checks what happens when a sorter client is removed and a
 // leaf node can be collapsed into its parent node, we correctly
 // propagate the `inactive` flag from leaf -> parent.
-TEST(DRFSorterTest, RemoveLeafCollapseParentInactive)
+TYPED_TEST(CommonSorterTest, RemoveLeafCollapseParentInactive)
 {
-  DRFSorter sorter;
+  TypeParam sorter;
 
   SlaveID slaveId;
   slaveId.set_value("agentId");
@@ -1070,7 +1077,12 @@ TEST(DRFSorterTest, RemoveLeafCollapseParentInactive)
 
   sorter.deactivate("a");
 
-  EXPECT_EQ(vector<string>({"b", "a/c"}), sorter.sort());
+  // We sort the `sort()` output alphabetically here since we only
+  // want to verify the content of elements but not their order.
+  vector<string> clients = sorter.sort();
+  sort(clients.begin(), clients.end());
+
+  EXPECT_EQ(vector<string>({"a/c", "b"}), clients);
 
   sorter.remove("a/c");
 
@@ -1210,6 +1222,22 @@ TYPED_TEST(CommonSorterTest, UpdateAllocation)
   EXPECT_EQ(
       CHECK_NOTERROR(ResourceQuantities::fromString("cpus:10;mem:10;disk:10")),
       sorter.allocationScalarQuantities());
+
+  // Test update allocation to empty.
+  Resources resourcesC =
+    CHECK_NOTERROR(Resources::parse("cpus:10;mem:10;disk:10"));
+
+  SlaveID slaveId2;
+  slaveId.set_value("agentId2");
+
+  sorter.add("c");
+  sorter.activate("c");
+
+  sorter.add(slaveId, resourcesC);
+
+  sorter.allocated("c", slaveId2, resourcesC);
+  sorter.update("c", slaveId2, resourcesC, Resources());
+  EXPECT_TRUE(sorter.allocation("c").empty());
 }
 
 
@@ -1277,11 +1305,6 @@ TYPED_TEST(CommonSorterTest, AllocationForInactiveClient)
 
   sorter.allocated("a", slaveId, Resources::parse("cpus:2;mem:2").get());
   sorter.allocated("b", slaveId, Resources::parse("cpus:3;mem:3").get());
-
-  hashmap<string, Resources> clientAllocation = sorter.allocation(slaveId);
-  EXPECT_EQ(2u, clientAllocation.size());
-  EXPECT_EQ(Resources::parse("cpus:2;mem:2").get(), clientAllocation.at("a"));
-  EXPECT_EQ(Resources::parse("cpus:3;mem:3").get(), clientAllocation.at("b"));
 
   hashmap<SlaveID, Resources> agentAllocation1 = sorter.allocation("a");
   EXPECT_EQ(1u, agentAllocation1.size());
@@ -2164,6 +2187,92 @@ TYPED_TEST(CommonSorterTest, BENCHMARK_HierarchyFullSort)
     }
   }
 }
+
+
+TEST(RoleTreeTest, RolesTracking) {
+  RoleTree roleTree;
+
+  // Tracking by weights.
+
+  roleTree.updateWeight("a/b/c", 2.0);
+
+  EXPECT_SOME(roleTree.get("a"));
+  EXPECT_SOME(roleTree.get("a/b"));
+  EXPECT_SOME(roleTree.get("a/b/c"));
+
+  EXPECT_EQ(master::DEFAULT_WEIGHT, (*roleTree.get("a"))->weight());
+  EXPECT_EQ(master::DEFAULT_WEIGHT, (*roleTree.get("a/b"))->weight());
+  EXPECT_EQ(2.0, (*roleTree.get("a/b/c"))->weight());
+
+  roleTree.updateWeight("a/b/c", master::DEFAULT_WEIGHT);
+
+  EXPECT_NONE(roleTree.get("a/b/c"));
+  EXPECT_NONE(roleTree.get("a/b"));
+  EXPECT_NONE(roleTree.get("a"));
+
+  // Tracking by quota.
+
+  Quota quota = createQuota("cpus:1");
+  roleTree.updateQuota("a/b/c", quota);
+
+  EXPECT_SOME(roleTree.get("a"));
+  EXPECT_SOME(roleTree.get("a/b"));
+  EXPECT_SOME(roleTree.get("a/b/c"));
+
+  EXPECT_EQ(master::DEFAULT_QUOTA, (*roleTree.get("a"))->quota());
+  EXPECT_EQ(master::DEFAULT_QUOTA, (*roleTree.get("a/b"))->quota());
+  EXPECT_EQ(quota, (*roleTree.get("a/b/c"))->quota());
+
+  roleTree.updateQuota("a/b/c", master::DEFAULT_QUOTA);
+
+  EXPECT_NONE(roleTree.get("a/b/c"));
+  EXPECT_NONE(roleTree.get("a/b"));
+  EXPECT_NONE(roleTree.get("a"));
+
+  // Tracking by reservation.
+
+  Resources reserved = CHECK_NOTERROR(Resources::parse("cpus(a/b/c):1"));
+  ResourceQuantities quantities =
+    ResourceQuantities::fromScalarResources(reserved);
+
+  roleTree.trackReservations(reserved);
+
+  EXPECT_SOME(roleTree.get("a"));
+  EXPECT_SOME(roleTree.get("a/b"));
+  EXPECT_SOME(roleTree.get("a/b/c"));
+
+  EXPECT_EQ(quantities, (*roleTree.get("a"))->reservationScalarQuantities());
+  EXPECT_EQ(quantities, (*roleTree.get("a/b"))->reservationScalarQuantities());
+  EXPECT_EQ(
+      quantities, (*roleTree.get("a/b/c"))->reservationScalarQuantities());
+
+  roleTree.untrackReservations(reserved);
+
+  EXPECT_NONE(roleTree.get("a/b/c"));
+  EXPECT_NONE(roleTree.get("a/b"));
+  EXPECT_NONE(roleTree.get("a"));
+
+  // Tracking by frameworks.
+
+  FrameworkID frameworkId;
+  frameworkId.set_value("framework");
+  roleTree.trackFramework(frameworkId, "a/b/c");
+
+  EXPECT_SOME(roleTree.get("a"));
+  EXPECT_SOME(roleTree.get("a/b"));
+  EXPECT_SOME(roleTree.get("a/b/c"));
+
+  EXPECT_TRUE((*roleTree.get("a"))->frameworks().empty());
+  EXPECT_TRUE((*roleTree.get("a/b"))->frameworks().empty());
+  EXPECT_EQ(1u, (*roleTree.get("a/b/c"))->frameworks().size());
+
+  roleTree.untrackFramework(frameworkId, "a/b/c");
+
+  EXPECT_NONE(roleTree.get("a/b/c"));
+  EXPECT_NONE(roleTree.get("a/b"));
+  EXPECT_NONE(roleTree.get("a"));
+}
+
 
 } // namespace tests {
 } // namespace internal {

@@ -103,6 +103,7 @@ MockSlave::MockSlave(
     QoSController* qosController,
     SecretGenerator* secretGenerator,
     VolumeGidManager* volumeGidManager,
+    PendingFutureTracker* futureTracker,
     const Option<Authorizer*>& authorizer)
   // It is necessary to explicitly call `ProcessBase` constructor here even
   // though the direct parent `Slave` already does this. This is because
@@ -122,6 +123,7 @@ MockSlave::MockSlave(
         qosController,
         secretGenerator,
         volumeGidManager,
+        futureTracker,
         authorizer)
 {
   // Set up default behaviors, calling the original methods.
@@ -153,6 +155,8 @@ MockSlave::MockSlave(
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_shutdownExecutor));
   EXPECT_CALL(*this, _shutdownExecutor(_, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked__shutdownExecutor));
+  EXPECT_CALL(*this, applyOperation(_))
+    .WillRepeatedly(Invoke(this, &MockSlave::unmocked_applyOperation));
 }
 
 
@@ -313,6 +317,11 @@ void MockSlave::unmocked__shutdownExecutor(
   slave::Slave::_shutdownExecutor(framework, executor);
 }
 
+
+void MockSlave::unmocked_applyOperation(const ApplyOperationMessage& message)
+{
+  slave::Slave::applyOperation(message);
+}
 
 } // namespace tests {
 } // namespace internal {

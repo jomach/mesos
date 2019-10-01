@@ -14,8 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef __MASTER_ALLOCATOR_SORTER_SORTER_HPP__
-#define __MASTER_ALLOCATOR_SORTER_SORTER_HPP__
+#ifndef __MASTER_ALLOCATOR_MESOS_SORTER_SORTER_HPP__
+#define __MASTER_ALLOCATOR_MESOS_SORTER_SORTER_HPP__
 
 #include <functional>
 #include <string>
@@ -114,10 +114,6 @@ public:
       const std::string& client) const = 0;
   virtual const ResourceQuantities& allocationScalarQuantities() const = 0;
 
-  // Returns the clients that have allocations on this slave.
-  virtual hashmap<std::string, Resources> allocation(
-      const SlaveID& slaveId) const = 0;
-
   // Returns the given slave's resources that have been allocated to
   // this client.
   virtual Resources allocation(
@@ -153,4 +149,4 @@ public:
 } // namespace internal {
 } // namespace mesos {
 
-#endif // __MASTER_ALLOCATOR_SORTER_SORTER_HPP__
+#endif // __MASTER_ALLOCATOR_MESOS_SORTER_SORTER_HPP__

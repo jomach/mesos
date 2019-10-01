@@ -103,6 +103,8 @@ using namespace mesos::internal;
 using namespace mesos::internal::master;
 using namespace mesos::scheduler;
 
+using google::protobuf::RepeatedPtrField;
+
 using mesos::master::detector::MasterDetector;
 
 using process::Clock;
@@ -114,8 +116,10 @@ using process::Process;
 using process::UPID;
 
 using std::map;
+using std::make_move_iterator;
 using std::mutex;
 using std::shared_ptr;
+using std::set;
 using std::string;
 using std::vector;
 using std::weak_ptr;
@@ -192,6 +196,7 @@ public:
   SchedulerProcess(MesosSchedulerDriver* _driver,
                    Scheduler* _scheduler,
                    const FrameworkInfo& _framework,
+                   const vector<string>& _suppressedRoles,
                    const Option<Credential>& _credential,
                    bool _implicitAcknowledgements,
                    const string& schedulerId,
@@ -214,10 +219,12 @@ public:
       driver(_driver),
       scheduler(_scheduler),
       framework(_framework),
+      suppressedRoles(_suppressedRoles.begin(), _suppressedRoles.end()),
       mutex(_mutex),
       latch(_latch),
       failover(_framework.has_id() && !framework.id().value().empty()),
       connected(false),
+      sendUpdateFrameworkOnConnect(false),
       running(true),
       detector(_detector),
       flags(_flags),
@@ -748,6 +755,11 @@ protected:
     connected = true;
     failover = false;
 
+    if (sendUpdateFrameworkOnConnect) {
+      sendUpdateFramework();
+    }
+    sendUpdateFrameworkOnConnect = false;
+
     Stopwatch stopwatch;
     if (FLAGS_v >= 1) {
       stopwatch.start();
@@ -790,6 +802,12 @@ protected:
     connected = true;
     failover = false;
 
+    if (sendUpdateFrameworkOnConnect) {
+      sendUpdateFramework();
+    }
+    sendUpdateFrameworkOnConnect = false;
+
+
     Stopwatch stopwatch;
     if (FLAGS_v >= 1) {
       stopwatch.start();
@@ -821,6 +839,8 @@ protected:
 
     Call::Subscribe* subscribe = call.mutable_subscribe();
     subscribe->mutable_framework_info()->CopyFrom(framework);
+    *subscribe->mutable_suppressed_roles() = RepeatedPtrField<string>(
+        suppressedRoles.begin(), suppressedRoles.end());
 
     if (framework.has_id() && !framework.id().value().empty()) {
       subscribe->set_force(failover);
@@ -1419,10 +1439,21 @@ protected:
     send(master->pid(), call);
   }
 
-  void reviveOffers()
+  void reviveOffers(const vector<string>& roles)
   {
+    if (roles.empty()) {
+      suppressedRoles.clear();
+    } else {
+      for (const string& role : roles) {
+        suppressedRoles.erase(role);
+      }
+    }
+
     if (!connected) {
-      VLOG(1) << "Ignoring revive offers message as master is disconnected";
+      VLOG(1) << "Ignoring REVIVE as master is disconnected;"
+              << " the set of suppressed roles in the driver has been updated"
+              << " and will be sent to the master during re-registration";
+      sendUpdateFrameworkOnConnect = true;
       return;
     }
 
@@ -1432,14 +1463,35 @@ protected:
     call.mutable_framework_id()->CopyFrom(framework.id());
     call.set_type(Call::REVIVE);
 
+    if (roles.empty()) {
+      VLOG(2) << "Sending REVIVE for all roles";
+    } else {
+      VLOG(2) << "Sending REVIVE for roles: " << stringify(roles);
+      *call.mutable_revive()->mutable_roles() =
+        RepeatedPtrField<string>(roles.begin(), roles.end());
+    }
+
     CHECK_SOME(master);
     send(master->pid(), call);
   }
 
-  void suppressOffers()
+  void suppressOffers(const vector<string>& roles)
   {
+    if (roles.empty()) {
+      suppressedRoles =
+        std::set<string>(framework.roles().begin(), framework.roles().end());
+    } else {
+      for (const string& role : roles) {
+        suppressedRoles.emplace(role);
+      }
+    }
+
     if (!connected) {
-      VLOG(1) << "Ignoring suppress offers message as master is disconnected";
+      VLOG(1) << "Ignoring SUPPRESS as master is disconnected;"
+              << " the set of suppressed roles in the driver has been updated"
+              << " and will be sent to the master during re-registration";
+
+      sendUpdateFrameworkOnConnect = true;
       return;
     }
 
@@ -1448,6 +1500,14 @@ protected:
     CHECK(framework.has_id());
     call.mutable_framework_id()->CopyFrom(framework.id());
     call.set_type(Call::SUPPRESS);
+
+    if (roles.empty()) {
+      VLOG(2) << "Sending SUPPRESS for all roles";
+    } else {
+      VLOG(2) << "Sending SUPPRESS for roles: " << stringify(roles);
+      *call.mutable_suppress()->mutable_roles() =
+        RepeatedPtrField<string>(roles.begin(), roles.end());
+    }
 
     CHECK_SOME(master);
     send(master->pid(), call);
@@ -1583,6 +1643,37 @@ protected:
     send(master->pid(), call);
   }
 
+  void updateFramework(
+      const FrameworkInfo& framework_,
+      set<string>&& suppressedRoles_)
+  {
+    if (!framework.has_id() || framework.id().value().empty()) {
+      error("MesosSchedulerDriver::updateFramework() must not be called"
+            " prior to registration with the master");
+      return;
+    }
+
+    if (framework_.id() != framework.id()) {
+      error("The 'FrameworkInfo.id' provided to"
+            " MesosSchedulerDriver::updateFramework()"
+            " (" + stringify(framework_.id()) + ")"
+            " must be equal to the value known to the MesosSchedulerDriver"
+            " (" + stringify(framework.id()) + ")");
+      return;
+    }
+
+    framework = framework_;
+    suppressedRoles = std::move(suppressedRoles_);
+
+    if (connected) {
+      sendUpdateFramework();
+    } else {
+      VLOG(1) << "Postponing UPDATE_FRAMEWORK call:"
+                 " not registered with master";
+      sendUpdateFrameworkOnConnect = true;
+    }
+  }
+
 private:
   friend class mesos::MesosSchedulerDriver;
 
@@ -1626,9 +1717,30 @@ private:
     return static_cast<double>(eventCount<DispatchEvent>());
   }
 
+  void sendUpdateFramework()
+  {
+    Call call;
+
+    CHECK(framework.has_id());
+    *call.mutable_framework_id() = framework.id();
+
+    call.set_type(Call::UPDATE_FRAMEWORK);
+    *call.mutable_update_framework()->mutable_framework_info() = framework;
+    *call.mutable_update_framework()->mutable_suppressed_roles() =
+      RepeatedPtrField<string>(suppressedRoles.begin(), suppressedRoles.end());
+
+    VLOG(1) << "Sending UPDATE_FRAMEWORK message";
+
+    CHECK_SOME(master);
+    send(master->pid(), call);
+  }
+
+
   MesosSchedulerDriver* driver;
   Scheduler* scheduler;
   FrameworkInfo framework;
+  set<string> suppressedRoles;
+
   std::recursive_mutex* mutex;
   Latch* latch;
 
@@ -1637,6 +1749,10 @@ private:
   Option<MasterInfo> master;
 
   bool connected; // Flag to indicate if framework is registered.
+
+  // Flag to indicate that an UPDATE_FRAMEWORK with a current FrameworkInfo
+  // should be sent after successful (re)connection attempt.
+  bool sendUpdateFrameworkOnConnect;
 
   // TODO(vinod): Instead of 'bool' use 'Status'.
   // We set 'running' to false in SchedulerDriver::stop() and
@@ -1684,6 +1800,25 @@ private:
 
 } // namespace internal {
 } // namespace mesos {
+
+
+void fillMissingFrameworkInfoFields(FrameworkInfo* framework)
+{
+  if (framework->user().empty()) {
+    Result<string> user = os::user();
+    CHECK_SOME(user);
+
+    *framework->mutable_user() = user.get();
+  }
+
+  if (framework->hostname().empty()) {
+    Try<string> hostname = net::hostname();
+
+    if (hostname.isSome()) {
+      *framework->mutable_hostname() = hostname.get();
+    }
+  }
+}
 
 
 void MesosSchedulerDriver::initialize() {
@@ -1741,20 +1876,7 @@ void MesosSchedulerDriver::initialize() {
   // see if the current user can switch to that user, or via an
   // authentication module ensure this is acceptable.
 
-  // See FrameWorkInfo in include/mesos/mesos.proto:
-  if (framework.user().empty()) {
-    Result<string> user = os::user();
-    CHECK_SOME(user);
-
-    framework.set_user(user.get());
-  }
-
-  if (framework.hostname().empty()) {
-    Try<string> hostname = net::hostname();
-    if (hostname.isSome()) {
-      framework.set_hostname(hostname.get());
-    }
-  }
+  fillMissingFrameworkInfoFields(&framework);
 
   // Launch a local cluster if necessary.
   Option<UPID> pid;
@@ -1850,6 +1972,51 @@ MesosSchedulerDriver::MesosSchedulerDriver(
   : detector(nullptr),
     scheduler(_scheduler),
     framework(_framework),
+    master(_master),
+    process(nullptr),
+    latch(nullptr),
+    status(DRIVER_NOT_STARTED),
+    implicitAcknowlegements(_implicitAcknowlegements),
+    credential(new Credential(_credential)),
+    schedulerId("scheduler-" + id::UUID::random().toString())
+{
+  initialize();
+}
+
+
+MesosSchedulerDriver::MesosSchedulerDriver(
+    Scheduler* _scheduler,
+    const FrameworkInfo& _framework,
+    const vector<string>& _suppressedRoles,
+    const string& _master,
+    bool _implicitAcknowlegements)
+  : detector(nullptr),
+    scheduler(_scheduler),
+    framework(_framework),
+    initialSuppressedRoles(_suppressedRoles),
+    master(_master),
+    process(nullptr),
+    latch(nullptr),
+    status(DRIVER_NOT_STARTED),
+    implicitAcknowlegements(_implicitAcknowlegements),
+    credential(nullptr),
+    schedulerId("scheduler-" + id::UUID::random().toString())
+{
+  initialize();
+}
+
+
+MesosSchedulerDriver::MesosSchedulerDriver(
+    Scheduler* _scheduler,
+    const FrameworkInfo& _framework,
+    const vector<string>& _suppressedRoles,
+    const string& _master,
+    bool _implicitAcknowlegements,
+    const Credential& _credential)
+  : detector(nullptr),
+    scheduler(_scheduler),
+    framework(_framework),
+    initialSuppressedRoles(_suppressedRoles),
     master(_master),
     process(nullptr),
     latch(nullptr),
@@ -1968,32 +2135,23 @@ Status MesosSchedulerDriver::start()
 
     CHECK(process == nullptr);
 
-    if (credential == nullptr) {
-      process = new SchedulerProcess(
-          this,
-          scheduler,
-          framework,
-          None(),
-          implicitAcknowlegements,
-          schedulerId,
-          detector.get(),
-          flags,
-          &mutex,
-          latch);
-    } else {
-      const Credential& cred = *credential;
-      process = new SchedulerProcess(
-          this,
-          scheduler,
-          framework,
-          cred,
-          implicitAcknowlegements,
-          schedulerId,
-          detector.get(),
-          flags,
-          &mutex,
-          latch);
+    Option<Credential> cred = None();
+    if (credential != nullptr) {
+      cred = *credential;
     }
+
+    process = new SchedulerProcess(
+        this,
+        scheduler,
+        framework,
+        initialSuppressedRoles,
+        cred,
+        implicitAcknowlegements,
+        schedulerId,
+        detector.get(),
+        flags,
+        &mutex,
+        latch);
 
     spawn(process);
 
@@ -2193,7 +2351,27 @@ Status MesosSchedulerDriver::reviveOffers()
 
     CHECK(process != nullptr);
 
-    dispatch(process, &SchedulerProcess::reviveOffers);
+    dispatch(process, &SchedulerProcess::reviveOffers, vector<string>());
+
+    return status;
+  }
+}
+
+
+Status MesosSchedulerDriver::reviveOffers(const vector<string>& roles)
+{
+  if (roles.empty()) {
+    return status;
+  }
+
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
+      return status;
+    }
+
+    CHECK(process != nullptr);
+
+    dispatch(process, &SchedulerProcess::reviveOffers, roles);
 
     return status;
   }
@@ -2209,7 +2387,27 @@ Status MesosSchedulerDriver::suppressOffers()
 
     CHECK(process != nullptr);
 
-    dispatch(process, &SchedulerProcess::suppressOffers);
+    dispatch(process, &SchedulerProcess::suppressOffers, vector<string>());
+
+    return status;
+  }
+}
+
+
+Status MesosSchedulerDriver::suppressOffers(const vector<string>& roles)
+{
+  if (roles.empty()) {
+    return status;
+  }
+
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
+      return status;
+    }
+
+    CHECK(process != nullptr);
+
+    dispatch(process, &SchedulerProcess::suppressOffers, roles);
 
     return status;
   }
@@ -2270,6 +2468,37 @@ Status MesosSchedulerDriver::reconcileTasks(
     CHECK(process != nullptr);
 
     dispatch(process, &SchedulerProcess::reconcileTasks, statuses);
+
+    return status;
+  }
+}
+
+
+Status MesosSchedulerDriver::updateFramework(
+  const FrameworkInfo& update,
+  const vector<string>& suppressedRoles_)
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
+      return status;
+    }
+
+    framework = update;
+
+    fillMissingFrameworkInfoFields(&framework);
+
+    CHECK(process != nullptr);
+
+    set<string> suppressedRoles(
+        suppressedRoles_.begin(), suppressedRoles_.end());
+
+    CHECK_EQ(suppressedRoles_.size(), suppressedRoles.size())
+      << "Invalid suppressed role list: contains"
+      << " " << suppressedRoles_.size() - suppressedRoles.size()
+      << " duplicates " << suppressedRoles_;
+
+    dispatch(process, &SchedulerProcess::updateFramework, framework,
+             std::move(suppressedRoles));
 
     return status;
   }

@@ -493,21 +493,8 @@ JSON::Object model(const FileInfo& fileInfo)
   return file;
 }
 
-
-JSON::Object model(const quota::QuotaInfo& quotaInfo)
-{
-  JSON::Object object;
-
-  object.values["guarantee"] = model(quotaInfo.guarantee());
-  object.values["role"] = quotaInfo.role();
-  if (quotaInfo.has_principal()) {
-    object.values["principal"] = quotaInfo.principal();
-  }
-
-  return object;
-}
-
 }  // namespace internal {
+
 
 void json(JSON::ObjectWriter* writer, const Attributes& attributes)
 {
@@ -766,6 +753,22 @@ void json(
 }
 
 
+void json(JSON::ObjectWriter* writer, const ResourceQuantities& quantities)
+{
+  foreachpair (const string& name, const Value::Scalar& scalar, quantities) {
+    writer->field(name, scalar.value());
+  }
+}
+
+
+void json(JSON::ObjectWriter* writer, const ResourceLimits& limits)
+{
+  foreachpair (const string& name, const Value::Scalar& scalar, limits) {
+    writer->field(name, scalar.value());
+  }
+}
+
+
 void json(JSON::ObjectWriter* writer, const SlaveInfo& slaveInfo)
 {
   writer->field("id", slaveInfo.id().value());
@@ -865,6 +868,13 @@ static void json(JSON::StringWriter* writer, const Value::Set& set)
 static void json(JSON::StringWriter* writer, const Value::Text& text)
 {
   writer->set(text.value());
+}
+
+
+void json(JSON::ObjectWriter* writer, const Quota& quota)
+{
+  writer->field("guarantees", quota.guarantees);
+  writer->field("limits", quota.limits);
 }
 
 

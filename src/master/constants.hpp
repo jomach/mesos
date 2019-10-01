@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include <mesos/mesos.hpp>
+#include <mesos/quota/quota.hpp>
 
 #include <stout/bytes.hpp>
 #include <stout/duration.hpp>
@@ -171,6 +172,12 @@ constexpr char DEFAULT_HTTP_FRAMEWORK_AUTHENTICATION_REALM[] =
 const Version MINIMUM_AGENT_VERSION = Version(1, 0, 0);
 
 std::vector<MasterInfo::Capability> MASTER_CAPABILITIES();
+
+// A role's default quota: no guarantees and no limits.
+const Quota DEFAULT_QUOTA;
+
+// Default weight for a role.
+constexpr double DEFAULT_WEIGHT = 1.0;
 
 } // namespace master {
 } // namespace internal {

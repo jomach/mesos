@@ -18,6 +18,7 @@
 #ifdef __linux__
 #include <sched.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #endif // __linux__
 #include <string.h>
 
@@ -33,6 +34,7 @@
 
 #include <stout/adaptor.hpp>
 #include <stout/foreach.hpp>
+#include <stout/fs.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
@@ -94,6 +96,7 @@ using mesos::internal::capabilities::ProcessCapabilities;
 using mesos::internal::seccomp::SeccompFilter;
 #endif
 
+using mesos::slave::ContainerFileOperation;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerMountInfo;
 
@@ -255,6 +258,19 @@ static void exitWithStatus(int status)
 #endif // __WINDOWS__
   ::_exit(status);
 }
+
+
+#ifdef __linux__
+static Try<Nothing> mountContainerFilesystem(const ContainerMountInfo& mount)
+{
+  return fs::mount(
+      mount.has_source() ? Option<string>(mount.source()) : None(),
+      mount.target(),
+      mount.has_type() ? Option<string>(mount.type()) : None(),
+      mount.has_flags() ? mount.flags() : 0,
+      mount.has_options() ? Option<string>(mount.options()) : None());
+}
+#endif // __linux__
 
 
 static Try<Nothing> prepareMounts(const ContainerLaunchInfo& launchInfo)
@@ -433,13 +449,7 @@ static Try<Nothing> prepareMounts(const ContainerLaunchInfo& launchInfo)
       }
     }
 
-    Try<Nothing> mnt = fs::mount(
-        (mount.has_source() ? Option<string>(mount.source()) : None()),
-        mount.target(),
-        (mount.has_type() ? Option<string>(mount.type()) : None()),
-        (mount.has_flags() ? mount.flags() : 0),
-        (mount.has_options() ? Option<string>(mount.options()) : None()));
-
+    Try<Nothing> mnt = mountContainerFilesystem(mount);
     if (mnt.isError()) {
       return Error(
           "Failed to mount '" + stringify(JSON::protobuf(mount)) +
@@ -447,6 +457,101 @@ static Try<Nothing> prepareMounts(const ContainerLaunchInfo& launchInfo)
     }
   }
 #endif // __linux__
+
+  return Nothing();
+}
+
+
+static Try<Nothing> maskPath(const string& target)
+{
+  Try<Nothing> mnt = Nothing();
+
+#ifdef __linux__
+  if (os::stat::isfile(target)) {
+    mnt = fs::mount("/dev/null", target, None(), MS_BIND | MS_RDONLY, None());
+  } else if (os::stat::isdir(target)) {
+    mnt = fs::mount(None(), target, "tmpfs", MS_RDONLY, "size=0");
+  }
+#endif // __linux__
+
+  if (mnt.isError()) {
+    return Error("Failed to mask '" + target + "': " + mnt.error());
+  }
+
+  return Nothing();
+}
+
+
+static Try<Nothing> executeFileOperation(const ContainerFileOperation& op)
+{
+  switch (op.operation()) {
+    case ContainerFileOperation::SYMLINK: {
+      Try<Nothing> result =
+        ::fs::symlink(op.symlink().source(), op.symlink().target());
+      if (result.isError()) {
+        return Error(
+            "Failed to link '" + op.symlink().source() + "' as '" +
+            op.symlink().target() + "': " + result.error());
+      }
+
+      return Nothing();
+    }
+
+    case ContainerFileOperation::MOUNT: {
+#ifdef __linux__
+      Try<Nothing> result = mountContainerFilesystem(op.mount());
+      if (result.isError()) {
+        return Error(
+            "Failed to mount '" + stringify(JSON::protobuf(op.mount())) +
+            "': " + result.error());
+      }
+
+      return Nothing();
+#else
+      return Error("Container mount is not supported on non-Linux systems");
+#endif // __linux__
+    }
+
+    case ContainerFileOperation::RENAME: {
+      Try<Nothing> result =
+        os::rename(op.rename().source(), op.rename().target());
+
+      // TODO(jpeach): We should only fall back to `mv` if the error
+      // is EXDEV, in which case a rename is a copy+unlink.
+      if (result.isError()) {
+        Option<int> status = os::spawn(
+            "mv", {"mv", "-f", op.rename().source(), op.rename().target()});
+
+        if (status.isNone()) {
+          return Error(
+              "Failed to rename '" + op.rename().source() + "' to '" +
+              op.rename().target() + "':  spawn failed");
+        }
+
+        if (!WSUCCEEDED(status.get())) {
+          return Error(
+              "Failed to rename '" + op.rename().source() + "' to '" +
+              op.rename().target() + "': " + WSTRINGIFY(status.get()));
+        }
+
+        result = Nothing();
+      }
+
+      return Nothing();
+  }
+
+    case ContainerFileOperation::MKDIR: {
+      Try<Nothing> result =
+        os::mkdir(op.mkdir().target(), op.mkdir().recursive());
+      if (result.isError()) {
+        return Error(
+            "Failed to create directory '" + op.mkdir().target() + "': " +
+            result.error());
+      }
+
+      return result;
+    }
+  }
 
   return Nothing();
 }
@@ -744,6 +849,21 @@ int MesosContainerizerLaunch::execute()
     exitWithStatus(EXIT_FAILURE);
   }
 
+  foreach (const string& target, launchInfo.masked_paths()) {
+    mount = maskPath(target);
+    if (mount.isError()) {
+      cerr << "Failed to mask container paths: " << mount.error() << endl;
+    }
+  }
+
+  foreach (const ContainerFileOperation& op, launchInfo.file_operations()) {
+    Try<Nothing> result = executeFileOperation(op);
+    if (result.isError()) {
+      cerr << result.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+  }
+
   // Run additional preparation commands. These are run as the same
   // user and with the environment as the agent.
   foreach (const CommandInfo& command, launchInfo.pre_exec_commands()) {
@@ -807,8 +927,8 @@ int MesosContainerizerLaunch::execute()
     }
 
     // No need to change user/groups if the specified user is the same
-    // as that of the current process.
-    if (_uid.get() != os::getuid().get()) {
+    // as the effective user of the current process.
+    if (_uid.get() != ::geteuid()) {
       Result<gid_t> _gid = os::getgid(launchInfo.user());
       if (!_gid.isSome()) {
         cerr << "Failed to get the gid of user '" << launchInfo.user() << "': "
@@ -1034,6 +1154,14 @@ int MesosContainerizerLaunch::execute()
     Try<Nothing> set = capabilitiesManager->set(capabilities.get());
     if (set.isError()) {
       cerr << "Failed to set process capabilities: " << set.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+  }
+
+  if (launchInfo.has_no_new_privileges()) {
+    const int val = launchInfo.no_new_privileges() ? 1 : 0;
+    if (prctl(PR_SET_NO_NEW_PRIVS, val, 0, 0, 0) == -1) {
+      cerr << "Failed to set NO_NEW_PRIVS: " << os::strerror(errno) << endl;
       exitWithStatus(EXIT_FAILURE);
     }
   }

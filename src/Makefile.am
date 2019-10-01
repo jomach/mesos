@@ -647,6 +647,7 @@ pkginclude_HEADERS =							\
   $(top_srcdir)/include/mesos/mesos.proto				\
   $(top_srcdir)/include/mesos/module.hpp				\
   $(top_srcdir)/include/mesos/resources.hpp				\
+  $(top_srcdir)/include/mesos/resource_quantities.hpp				\
   $(top_srcdir)/include/mesos/roles.hpp					\
   $(top_srcdir)/include/mesos/scheduler.hpp				\
   $(top_srcdir)/include/mesos/type_utils.hpp				\
@@ -1066,16 +1067,18 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   common/build.hpp							\
   common/command_utils.cpp						\
   common/command_utils.hpp						\
+  common/future_tracker.hpp						\
   common/heartbeater.hpp						\
   common/http.cpp							\
   common/http.hpp							\
+  common/kernel_version.cpp						\
+  common/kernel_version.hpp						\
   common/parse.hpp							\
   common/protobuf_utils.cpp						\
   common/protobuf_utils.hpp						\
   common/recordio.hpp							\
   common/resources.cpp							\
   common/resource_quantities.cpp					\
-  common/resource_quantities.hpp					\
   common/resources_utils.cpp						\
   common/resources_utils.hpp						\
   common/roles.cpp							\
@@ -1089,6 +1092,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   docker/docker.cpp							\
   docker/docker.hpp							\
   docker/executor.hpp							\
+  docker/executor.cpp							\
   docker/spec.cpp							\
   examples/flags.hpp							\
   examples/test_anonymous_module.hpp					\
@@ -1121,14 +1125,14 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   master/allocator/mesos/hierarchical.hpp				\
   master/allocator/mesos/metrics.cpp					\
   master/allocator/mesos/metrics.hpp					\
-  master/allocator/sorter/drf/metrics.cpp				\
-  master/allocator/sorter/drf/metrics.hpp				\
-  master/allocator/sorter/drf/sorter.cpp				\
-  master/allocator/sorter/drf/sorter.hpp				\
-  master/allocator/sorter/random/sorter.cpp				\
-  master/allocator/sorter/random/sorter.hpp				\
-  master/allocator/sorter/random/utils.hpp				\
-  master/allocator/sorter/sorter.hpp					\
+  master/allocator/mesos/sorter/drf/metrics.cpp				\
+  master/allocator/mesos/sorter/drf/metrics.hpp				\
+  master/allocator/mesos/sorter/drf/sorter.cpp				\
+  master/allocator/mesos/sorter/drf/sorter.hpp				\
+  master/allocator/mesos/sorter/random/sorter.cpp				\
+  master/allocator/mesos/sorter/random/sorter.hpp				\
+  master/allocator/mesos/sorter/random/utils.hpp				\
+  master/allocator/mesos/sorter/sorter.hpp					\
   master/constants.cpp							\
   master/constants.hpp							\
   master/contender/contender.cpp					\
@@ -1174,6 +1178,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   oci/spec.cpp								\
   posix/rlimits.cpp							\
   posix/rlimits.hpp							\
+  resource_provider/constants.hpp					\
   resource_provider/daemon.cpp						\
   resource_provider/daemon.hpp						\
   resource_provider/detector.cpp					\
@@ -1224,6 +1229,8 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   slave/containerizer/mesos/io/switchboard.hpp				\
   slave/containerizer/mesos/isolator.cpp				\
   slave/containerizer/mesos/isolator.hpp				\
+  slave/containerizer/mesos/isolator_tracker.cpp			\
+  slave/containerizer/mesos/isolator_tracker.hpp			\
   slave/containerizer/mesos/isolators/docker/volume/driver.cpp		\
   slave/containerizer/mesos/isolators/docker/volume/driver.hpp		\
   slave/containerizer/mesos/isolators/docker/volume/paths.cpp		\
@@ -1251,6 +1258,8 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   slave/containerizer/mesos/launch.hpp					\
   slave/containerizer/mesos/launcher.cpp				\
   slave/containerizer/mesos/launcher.hpp				\
+  slave/containerizer/mesos/launcher_tracker.cpp			\
+  slave/containerizer/mesos/launcher_tracker.hpp			\
   slave/containerizer/mesos/mount.cpp					\
   slave/containerizer/mesos/mount.hpp					\
   slave/containerizer/mesos/paths.cpp					\
@@ -1428,6 +1437,8 @@ MESOS_LINUX_FILES =									\
   slave/containerizer/mesos/isolators/linux/capabilities.hpp				\
   slave/containerizer/mesos/isolators/linux/devices.cpp					\
   slave/containerizer/mesos/isolators/linux/devices.hpp					\
+  slave/containerizer/mesos/isolators/linux/nnp.hpp					\
+  slave/containerizer/mesos/isolators/linux/nnp.cpp					\
   slave/containerizer/mesos/isolators/namespaces/ipc.cpp				\
   slave/containerizer/mesos/isolators/namespaces/ipc.hpp				\
   slave/containerizer/mesos/isolators/namespaces/pid.cpp				\
@@ -1578,7 +1589,7 @@ libmesos_no_3rdparty_la_LIBADD += libbuild.la
 # Convenience library for build the CSI client.
 noinst_LTLIBRARIES += libcsi.la
 libcsi_la_SOURCES =							\
-  csi/types.cpp								\
+  csi/constants.hpp							\
   csi/metrics.cpp							\
   csi/metrics.hpp							\
   csi/paths.cpp								\
@@ -1587,6 +1598,7 @@ libcsi_la_SOURCES =							\
   csi/service_manager.hpp						\
   csi/state.hpp								\
   csi/state.proto							\
+  csi/types.cpp								\
   csi/v0.cpp								\
   csi/v0_client.cpp							\
   csi/v0_client.hpp							\
@@ -1809,7 +1821,7 @@ mesos_usage_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_usage_LDADD = libmesos.la $(LDADD)
 
 pkglibexec_PROGRAMS += mesos-docker-executor
-mesos_docker_executor_SOURCES = docker/executor.cpp
+mesos_docker_executor_SOURCES = launcher/docker_executor.cpp
 mesos_docker_executor_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_docker_executor_LDADD = libmesos.la $(LDADD)
 
@@ -1834,14 +1846,52 @@ mesos_resolve_CPPFLAGS = $(MESOS_CPPFLAGS)
 mesos_resolve_LDADD = libmesos.la $(LDADD)
 
 bin_PROGRAMS += mesos
+
+NEW_CLI_PLUGINS = \
+	python/cli_new/lib/cli/plugins/agent/__init__.py		\
+	python/cli_new/lib/cli/plugins/agent/main.py			\
+	python/cli_new/lib/cli/plugins/config/__init__.py		\
+	python/cli_new/lib/cli/plugins/config/main.py			\
+	python/cli_new/lib/cli/plugins/task/__init__.py			\
+	python/cli_new/lib/cli/plugins/task/main.py			\
+	python/cli_new/lib/cli/plugins/__init__.py			\
+	python/cli_new/lib/cli/plugins/base.py
+
+NEW_CLI = \
+	python/cli_new/bin/main.py					\
+	python/cli_new/bin/mesos					\
+	python/cli_new/bin/mesos-cli-tests				\
+	python/cli_new/bin/settings.py					\
+	python/cli_new/activate						\
+	python/cli_new/deactivate					\
+	python/cli_new/lib/cli/__init__.py				\
+	python/cli_new/lib/cli/constants.py				\
+	python/cli_new/lib/cli/tests/tests.py				\
+	python/cli_new/lib/cli/tests/__init__.py			\
+	python/cli_new/lib/cli/tests/agent.py				\
+	python/cli_new/lib/cli/tests/base.py				\
+	python/cli_new/lib/cli/tests/constants.py			\
+	python/cli_new/lib/cli/tests/data/lorem-ipsum.txt		\
+	python/cli_new/lib/cli/tests/task.py				\
+	python/cli_new/lib/cli/config.py				\
+	python/cli_new/lib/cli/docopt.py				\
+	python/cli_new/lib/cli/exceptions.py				\
+	python/cli_new/lib/cli/http.py					\
+	python/cli_new/lib/cli/mesos.py					\
+	python/cli_new/lib/cli/util.py					\
+	python/cli_new/mesos.bash_completion				\
+	python/cli_new/tests/default_config.toml			\
+	python/cli_new/tests/CMakeLists.txt				\
+	python/cli_new/tests/__init__.py				\
+	python/cli_new/tests/main.py					\
+	python/cli_new/CMakeLists.txt					\
+	python/cli_new/README.md					\
+	python/cli_new/bootstrap					\
+	python/cli_new/pip-requirements.txt
+
 if ENABLE_NEW_CLI
 MESOS_CLI_SRCDIR = $(srcdir)/python/cli_new
 MESOS_CLI_BUILDDIR = $(builddir)/cli
-MESOS_CLI_HIDDEN_IMPORTS =					\
-	$(patsubst %, --hidden-import cli.plugins.%,		\
-		$(notdir $(shell find				\
-			   $(MESOS_CLI_SRCDIR)/lib/cli/plugins	\
-			     -mindepth 1 -maxdepth 1 -type d)))
 
 mesos: $(shell git ls-files $(MESOS_CLI_SRCDIR))
 	@echo "Building the CLI ..."
@@ -1852,7 +1902,7 @@ mesos: $(shell git ls-files $(MESOS_CLI_SRCDIR))
 		> $(MESOS_CLI_BUILDDIR)/version.py &&	\
 	source $(builddir)/.virtualenv/bin/activate &&	\
 	pyinstaller -p $(MESOS_CLI_SRCDIR)/lib		\
-		$(MESOS_CLI_HIDDEN_IMPORTS)		\
+		$(NEW_CLI_PLUGINS)			\
 		--specpath $(MESOS_CLI_BUILDDIR)	\
 		--workpath $(MESOS_CLI_BUILDDIR)/work	\
 		--distpath $(builddir)			\
@@ -1861,6 +1911,9 @@ mesos: $(shell git ls-files $(MESOS_CLI_SRCDIR))
 		--onefile				\
 		$(MESOS_CLI_SRCDIR)/bin/main.py
 check_PROGRAMS += mesos
+
+EXTRA_DIST += cli/mesos.cpp
+
 else
 mesos_SOURCES = cli/mesos.cpp
 mesos_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -1873,6 +1926,22 @@ dist_bin_SCRIPTS +=							\
   cli/mesos-scp								\
   cli/mesos-tail
 endif
+
+EXTRA_DIST += \
+	$(NEW_CLI)							\
+	$(NEW_CLI_PLUGINS)						\
+	python/lib/mesos/__init__.py					\
+	python/lib/mesos/exceptions.py					\
+	python/lib/mesos/http.py					\
+	python/lib/mesos/recordio.py					\
+	python/lib/tests/__init__.py					\
+	python/lib/tests/conftest.py					\
+	python/lib/tests/test_exceptions.py				\
+	python/lib/tests/test_http.py					\
+	python/lib/tests/test_mesos.py					\
+	python/lib/tests/test_recordio.py				\
+	python/lib/requirements.in					\
+	python/lib/setup.py
 
 # Need to distribute/install webui javascript. We use 'pkgdatadir'
 # instead of 'datadir' as the install directory so we get the
@@ -2596,12 +2665,16 @@ mesos_tests_SOURCES =						\
   tests/master_allocator_tests.cpp				\
   tests/master_authorization_tests.cpp				\
   tests/master_benchmarks.cpp					\
-  tests/master_contender_detector_tests.cpp     \
+  tests/master_contender_detector_tests.cpp			\
+  tests/master_draining_tests.cpp				\
   tests/master_load_tests.cpp					\
   tests/master_maintenance_tests.cpp				\
   tests/master_quota_tests.cpp					\
   tests/master_slave_reconciliation_tests.cpp			\
   tests/master_tests.cpp					\
+  tests/master/mock_master_api_subscriber.cpp			\
+  tests/master/mock_master_api_subscriber.hpp			\
+  tests/master/update_framework_tests.cpp			\
   tests/master_validation_tests.cpp				\
   tests/mesos.cpp						\
   tests/mesos.hpp						\
@@ -2667,6 +2740,7 @@ mesos_tests_SOURCES =						\
   tests/zookeeper_test_server.hpp				\
   tests/zookeeper_url_tests.cpp					\
   tests/common/command_utils_tests.cpp				\
+  tests/common/future_tracker_tests.cpp				\
   tests/common/http_tests.cpp					\
   tests/common/recordio_tests.cpp				\
   tests/common/type_utils_tests.cpp				\
@@ -2753,6 +2827,7 @@ mesos_tests_SOURCES +=						\
   tests/containerizer/docker_volume_isolator_tests.cpp		\
   tests/containerizer/linux_devices_isolator_tests.cpp		\
   tests/containerizer/linux_filesystem_isolator_tests.cpp	\
+  tests/containerizer/linux_nnp_isolator_tests.cpp		\
   tests/containerizer/fs_tests.cpp				\
   tests/containerizer/memory_pressure_tests.cpp			\
   tests/containerizer/nested_mesos_containerizer_tests.cpp	\
@@ -2920,6 +2995,8 @@ if ENABLE_NEW_CLI
 	source $(builddir)/.virtualenv/bin/activate;		\
 	source $(builddir)/.virtualenv/bin/postactivate;	\
 	PATH=$(builddir):$$PATH mesos-cli-tests
+
+	tox -c $(srcdir)/python/lib/tox.ini
 endif
 
 if INSTALL_TESTS

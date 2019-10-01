@@ -24,13 +24,20 @@ namespace mesos {
 namespace internal {
 namespace tests {
 
-Quota createQuota(const string& role, const string& resources)
-{
-  mesos::quota::QuotaInfo quotaInfo;
-  quotaInfo.set_role(role);
-  *quotaInfo.mutable_guarantee() = CHECK_NOTERROR(Resources::parse(resources));
 
-  return Quota{quotaInfo};
+Quota createQuota(const string& guarantees, const string& limits)
+{
+  Quota quota;
+  quota.guarantees = CHECK_NOTERROR(ResourceQuantities::fromString(guarantees));
+  quota.limits = CHECK_NOTERROR(ResourceLimits::fromString(limits));
+
+  return quota;
+}
+
+
+Quota createQuota(const string& resources)
+{
+  return createQuota(resources, resources);
 }
 
 

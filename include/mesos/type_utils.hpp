@@ -26,6 +26,8 @@
 #include <google/protobuf/map.h>
 #include <google/protobuf/repeated_field.h>
 
+#include <google/protobuf/util/message_differencer.h>
+
 #include <mesos/mesos.hpp>
 
 #include <stout/stringify.hpp>
@@ -60,6 +62,8 @@ bool operator==(
 bool operator==(const DiscoveryInfo& left, const DiscoveryInfo& right);
 bool operator==(const Environment& left, const Environment& right);
 bool operator==(const ExecutorInfo& left, const ExecutorInfo& right);
+bool operator==(const HealthCheck& left, const HealthCheck& right);
+bool operator==(const KillPolicy& left, const KillPolicy& right);
 bool operator==(const Label& left, const Label& right);
 bool operator==(const Labels& left, const Labels& right);
 bool operator==(const MasterInfo& left, const MasterInfo& right);
@@ -221,6 +225,18 @@ inline bool operator==(const DomainInfo& left, const DomainInfo& right)
 }
 
 
+inline bool operator==(const DrainInfo& left, const DrainInfo& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
+}
+
+
+inline bool operator==(const DrainConfig& left, const DrainConfig& right)
+{
+  return google::protobuf::util::MessageDifferencer::Equals(left, right);
+}
+
+
 /**
  * For machines to match, both the `hostname` and `ip` must be equivalent.
  * Hostname is not case sensitive, so it is lowercased before comparison.
@@ -322,6 +338,12 @@ inline bool operator<(const ContainerID& left, const ContainerID& right)
 }
 
 
+inline bool operator<(const DurationInfo& left, const DurationInfo& right)
+{
+  return left.nanoseconds() < right.nanoseconds();
+}
+
+
 inline bool operator<(const ExecutorID& left, const ExecutorID& right)
 {
   return left.value() < right.value();
@@ -379,6 +401,12 @@ std::ostream& operator<<(
 
 
 std::ostream& operator<<(std::ostream& stream, const DomainInfo& domainInfo);
+
+
+std::ostream& operator<<(std::ostream& stream, const DrainConfig& drainConfig);
+
+
+std::ostream& operator<<(std::ostream& stream, const DrainState& state);
 
 
 std::ostream& operator<<(std::ostream& stream, const Environment& environment);

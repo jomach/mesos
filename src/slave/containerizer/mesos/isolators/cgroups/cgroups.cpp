@@ -42,6 +42,8 @@
 #include "slave/containerizer/mesos/isolators/cgroups/cgroups.hpp"
 #include "slave/containerizer/mesos/isolators/cgroups/constants.hpp"
 
+using mesos::internal::protobuf::slave::containerSymlinkOperation;
+
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerLimitation;
@@ -565,18 +567,12 @@ Future<Option<ContainerLaunchInfo>> CgroupsIsolatorProcess::__prepare(
   foreach (const string& hierarchy, subsystems.keys()) {
     if (subsystems.get(hierarchy).size() > 1) {
       foreach (const Owned<Subsystem>& subsystem, subsystems.get(hierarchy)) {
-        CommandInfo* command = launchInfo.add_pre_exec_commands();
-        command->set_shell(false);
-        command->set_value("ln");
-        command->add_arguments("ln");
-        command->add_arguments("-s");
-        command->add_arguments(
-            path::join("/sys/fs/cgroup", Path(hierarchy).basename()));
-
-        command->add_arguments(path::join(
-            containerConfig.rootfs(),
-            "/sys/fs/cgroup",
-            subsystem->name()));
+        *launchInfo.add_file_operations() = containerSymlinkOperation(
+            path::join("/sys/fs/cgroup", Path(hierarchy).basename()),
+            path::join(
+              containerConfig.rootfs(),
+              "/sys/fs/cgroup",
+              subsystem->name()));
       }
     }
   }
@@ -667,9 +663,67 @@ Future<Nothing> CgroupsIsolatorProcess::isolate(
     const ContainerID& containerId,
     pid_t pid)
 {
-  // If we are a nested container, we inherit
-  // the cgroup from our root ancestor.
-  ContainerID rootContainerId = protobuf::getRootContainerId(containerId);
+  // We currently can't call `subsystem->isolate()` on nested
+  // containers, because we don't call `prepare()`, `recover()`, or
+  // `cleanup()` on them either. If we were to call `isolate()` on
+  // them, the call would likely fail because the subsystem doesn't
+  // know about the container. This is currently OK because the only
+  // cgroup isolator that even implements `isolate()` is the
+  // `NetClsSubsystem` and it doesn't do anything with the `pid`
+  // passed in.
+  //
+  // TODO(klueska): In the future we should revisit this to make
+  // sure that doing things this way is sufficient (or otherwise
+  // update our invariants to allow us to call this here).
+
+  vector<Future<Nothing>> isolates;
+
+  if (!containerId.has_parent()) {
+    foreachvalue (const Owned<Subsystem>& subsystem, subsystems) {
+      isolates.push_back(subsystem->isolate(
+          containerId,
+          infos[containerId]->cgroup,
+          pid));
+    }
+  }
+
+  // We isolate all the subsystems first so that the subsystem is
+  // fully configured before assigning the process. This improves
+  // the atomicity of the assignment for any system processes that
+  // observe it.
+  return await(isolates)
+    .then(defer(
+        PID<CgroupsIsolatorProcess>(this),
+        &CgroupsIsolatorProcess::_isolate,
+        lambda::_1,
+        containerId,
+        pid));
+}
+
+
+Future<Nothing> CgroupsIsolatorProcess::_isolate(
+    const vector<Future<Nothing>>& futures,
+    const ContainerID& containerId,
+    pid_t pid)
+{
+  vector<string> errors;
+
+  foreach (const Future<Nothing>& future, futures) {
+    if (!future.isReady()) {
+      errors.push_back((future.isFailed()
+          ? future.failure()
+          : "discarded"));
+    }
+  }
+
+  if (!errors.empty()) {
+    return Failure(
+        "Failed to isolate subsystems: " +
+        strings::join(";", errors));
+  }
+
+  // If we are a nested container, we inherit the cgroup from our parent.
+  const ContainerID rootContainerId = protobuf::getRootContainerId(containerId);
 
   if (!infos.contains(rootContainerId)) {
     return Failure("Failed to isolate the container: Unknown root container");
@@ -707,56 +761,6 @@ Future<Nothing> CgroupsIsolatorProcess::isolate(
 
       return Failure(message);
     }
-  }
-
-  // We currently can't call `subsystem->isolate()` on nested
-  // containers, because we don't call `prepare()`, `recover()`, or
-  // `cleanup()` on them either. If we were to call `isolate()` on
-  // them, the call would likely fail because the subsystem doesn't
-  // know about the container. This is currently OK because the only
-  // cgroup isolator that even implements `isolate()` is the
-  // `NetClsSubsystem` and it doesn't do anything with the `pid`
-  // passed in.
-  //
-  // TODO(klueska): In the future we should revisit this to make
-  // sure that doing things this way is sufficient (or otherwise
-  // update our invariants to allow us to call this here).
-  if (containerId.has_parent()) {
-    return Nothing();
-  }
-
-  vector<Future<Nothing>> isolates;
-  foreachvalue (const Owned<Subsystem>& subsystem, subsystems) {
-    isolates.push_back(subsystem->isolate(
-        containerId,
-        infos[containerId]->cgroup,
-        pid));
-  }
-
-  return await(isolates)
-    .then(defer(
-        PID<CgroupsIsolatorProcess>(this),
-        &CgroupsIsolatorProcess::_isolate,
-        lambda::_1));
-}
-
-
-Future<Nothing> CgroupsIsolatorProcess::_isolate(
-    const vector<Future<Nothing>>& futures)
-{
-  vector<string> errors;
-  foreach (const Future<Nothing>& future, futures) {
-    if (!future.isReady()) {
-      errors.push_back((future.isFailed()
-          ? future.failure()
-          : "discarded"));
-    }
-  }
-
-  if (errors.size() > 0) {
-    return Failure(
-        "Failed to isolate subsystems: " +
-        strings::join(";", errors));
   }
 
   return Nothing();

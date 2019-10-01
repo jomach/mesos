@@ -73,8 +73,6 @@
 #include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
 
-#include "internal/devolve.hpp"
-
 #include "messages/messages.hpp" // For google::protobuf::Message.
 
 #include "master/master.hpp"
@@ -121,6 +119,95 @@ constexpr char DEFAULT_JWT_SECRET_KEY[] =
 class MockExecutor;
 
 
+struct SlaveOptions
+{
+  SlaveOptions(
+      mesos::master::detector::MasterDetector* detector,
+      bool mock = false)
+    : detector(detector), mock(mock)
+  {}
+
+  SlaveOptions& withFlags(const Option<slave::Flags>& flags)
+  {
+    this->flags = flags;
+    return *this;
+  }
+
+  SlaveOptions& withId(const Option<std::string>& id)
+  {
+    this->id = id;
+    return *this;
+  }
+
+  SlaveOptions& withContainerizer(
+      const Option<slave::Containerizer*>& containerizer)
+  {
+    this->containerizer = containerizer;
+    return *this;
+  }
+
+  SlaveOptions& withGc(const Option<slave::GarbageCollector*>& gc)
+  {
+    this->gc = gc;
+    return *this;
+  }
+
+  SlaveOptions& withTaskStatusUpdateManager(
+      const Option<slave::TaskStatusUpdateManager*>& taskStatusUpdateManager)
+  {
+    this->taskStatusUpdateManager = taskStatusUpdateManager;
+    return *this;
+  }
+
+  SlaveOptions& withResourceEstimator(
+      const Option<mesos::slave::ResourceEstimator*>& resourceEstimator)
+  {
+    this->resourceEstimator = resourceEstimator;
+    return *this;
+  }
+
+  SlaveOptions& withQosController(
+      const Option<mesos::slave::QoSController*>& qosController)
+  {
+    this->qosController = qosController;
+    return *this;
+  }
+
+  SlaveOptions& withSecretGenerator(
+      const Option<mesos::SecretGenerator*>& secretGenerator)
+  {
+    this->secretGenerator = secretGenerator;
+    return *this;
+  }
+
+  SlaveOptions& withAuthorizer(const Option<Authorizer*>& authorizer)
+  {
+    this->authorizer = authorizer;
+    return *this;
+  }
+
+  SlaveOptions& withFutureTracker(
+      const Option<PendingFutureTracker*>& futureTracker)
+  {
+    this->futureTracker = futureTracker;
+    return *this;
+  }
+
+  mesos::master::detector::MasterDetector* detector;
+  bool mock;
+  Option<slave::Flags> flags;
+  Option<std::string> id;
+  Option<slave::Containerizer*> containerizer;
+  Option<slave::GarbageCollector*> gc;
+  Option<slave::TaskStatusUpdateManager*> taskStatusUpdateManager;
+  Option<mesos::slave::ResourceEstimator*> resourceEstimator;
+  Option<mesos::slave::QoSController*> qosController;
+  Option<mesos::SecretGenerator*> secretGenerator;
+  Option<Authorizer*> authorizer;
+  Option<PendingFutureTracker*> futureTracker;
+};
+
+
 // NOTE: `SSLTemporaryDirectoryTest` exists even when SSL is not compiled into
 // Mesos.  In this case, the class is an alias of `TemporaryDirectoryTest`.
 class MesosTest : public SSLTemporaryDirectoryTest
@@ -159,24 +246,11 @@ protected:
       const std::shared_ptr<MockRateLimiter>& slaveRemovalLimiter,
       const Option<master::Flags>& flags = None());
 
-  // TODO(bmahler): Consider adding a builder style interface, e.g.
-  //
-  // Try<PID<Slave>> slave =
-  //   Slave().With(flags)
-  //          .With(executor)
-  //          .With(containerizer)
-  //          .With(detector)
-  //          .With(gc)
-  //          .Start();
-  //
-  // Or options:
-  //
-  // Injections injections;
-  // injections.executor = executor;
-  // injections.containerizer = containerizer;
-  // injections.detector = detector;
-  // injections.gc = gc;
-  // Try<PID<Slave>> slave = StartSlave(injections);
+  // Starts a slave with the specified options.
+  // NOTE: This is a preferred method to start a slave.
+  // The other overloads of `StartSlave` are DEPRECATED!
+  virtual Try<process::Owned<cluster::Slave>> StartSlave(
+      const SlaveOptions& options);
 
   // Starts a slave with the specified detector and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
@@ -1323,65 +1397,102 @@ inline typename TOffer::Operation RESERVE(
   operation.mutable_reserve()->mutable_resources()->CopyFrom(resources);
 
   if (operationId.isSome()) {
-    operation.mutable_id()->CopyFrom(operationId.get());
+    *operation.mutable_id() = operationId.get();
   }
 
   return operation;
 }
 
 
-template <typename TResources, typename TOffer>
-inline typename TOffer::Operation UNRESERVE(const TResources& resources)
+template <typename TResources, typename TOperationID, typename TOffer>
+inline typename TOffer::Operation UNRESERVE(
+    const TResources& resources,
+    const Option<TOperationID>& operationId = None())
 {
   typename TOffer::Operation operation;
   operation.set_type(TOffer::Operation::UNRESERVE);
   operation.mutable_unreserve()->mutable_resources()->CopyFrom(resources);
+
+  if (operationId.isSome()) {
+    *operation.mutable_id() = operationId.get();
+  }
+
   return operation;
 }
 
 
-template <typename TResources, typename TOffer>
-inline typename TOffer::Operation CREATE(const TResources& volumes)
+template <typename TResources, typename TOperationID, typename TOffer>
+inline typename TOffer::Operation CREATE(
+    const TResources& volumes,
+    const Option<TOperationID>& operationId = None())
 {
   typename TOffer::Operation operation;
   operation.set_type(TOffer::Operation::CREATE);
   operation.mutable_create()->mutable_volumes()->CopyFrom(volumes);
+
+  if (operationId.isSome()) {
+    *operation.mutable_id() = operationId.get();
+  }
+
   return operation;
 }
 
 
-template <typename TResources, typename TOffer>
-inline typename TOffer::Operation DESTROY(const TResources& volumes)
+template <typename TResources, typename TOperationID, typename TOffer>
+inline typename TOffer::Operation DESTROY(
+    const TResources& volumes,
+    const Option<TOperationID>& operationId = None())
 {
   typename TOffer::Operation operation;
   operation.set_type(TOffer::Operation::DESTROY);
   operation.mutable_destroy()->mutable_volumes()->CopyFrom(volumes);
+
+  if (operationId.isSome()) {
+    *operation.mutable_id() = operationId.get();
+  }
+
   return operation;
 }
 
 
-template <typename TResource, typename TOffer>
+template <typename TResource, typename TOperationID, typename TOffer>
 inline typename TOffer::Operation GROW_VOLUME(
     const TResource& volume,
-    const TResource& addition)
+    const TResource& addition,
+    const Option<TOperationID>& operationId = None())
 {
   typename TOffer::Operation operation;
   operation.set_type(TOffer::Operation::GROW_VOLUME);
   operation.mutable_grow_volume()->mutable_volume()->CopyFrom(volume);
   operation.mutable_grow_volume()->mutable_addition()->CopyFrom(addition);
+
+  if (operationId.isSome()) {
+    *operation.mutable_id() = operationId.get();
+  }
+
   return operation;
 }
 
 
-template <typename TResource, typename TOffer, typename TValueScalar>
+template <
+    typename TResource,
+    typename TValueScalar,
+    typename TOperationID,
+    typename TOffer>
 inline typename TOffer::Operation SHRINK_VOLUME(
     const TResource& volume,
-    const TValueScalar& subtract)
+    const TValueScalar& subtract,
+    const Option<TOperationID>& operationId = None())
 {
   typename TOffer::Operation operation;
   operation.set_type(TOffer::Operation::SHRINK_VOLUME);
   operation.mutable_shrink_volume()->mutable_volume()->CopyFrom(volume);
   operation.mutable_shrink_volume()->mutable_subtract()->CopyFrom(subtract);
+
+  if (operationId.isSome()) {
+    *operation.mutable_id() = operationId.get();
+  }
+
   return operation;
 }
 
@@ -1767,35 +1878,40 @@ inline Offer::Operation RESERVE(Args&&... args)
 template <typename... Args>
 inline Offer::Operation UNRESERVE(Args&&... args)
 {
-  return common::UNRESERVE<Resources, Offer>(std::forward<Args>(args)...);
+  return common::UNRESERVE<Resources, OperationID, Offer>(
+      std::forward<Args>(args)...);
 }
 
 
 template <typename... Args>
 inline Offer::Operation CREATE(Args&&... args)
 {
-  return common::CREATE<Resources, Offer>(std::forward<Args>(args)...);
+  return common::CREATE<Resources, OperationID, Offer>(
+      std::forward<Args>(args)...);
 }
 
 
 template <typename... Args>
 inline Offer::Operation DESTROY(Args&&... args)
 {
-  return common::DESTROY<Resources, Offer>(std::forward<Args>(args)...);
+  return common::DESTROY<Resources, OperationID, Offer>(
+      std::forward<Args>(args)...);
 }
 
 
 template <typename... Args>
 inline Offer::Operation GROW_VOLUME(Args&&... args)
 {
-  return common::GROW_VOLUME<Resource, Offer>(std::forward<Args>(args)...);
+  return common::GROW_VOLUME<Resource, OperationID, Offer>(
+      std::forward<Args>(args)...);
 }
 
 
 template <typename... Args>
 inline Offer::Operation SHRINK_VOLUME(Args&&... args)
 {
-  return common::SHRINK_VOLUME<Resource, Offer>(std::forward<Args>(args)...);
+  return common::SHRINK_VOLUME<Resource, Value::Scalar, OperationID, Offer>(
+      std::forward<Args>(args)...);
 }
 
 
@@ -2065,40 +2181,51 @@ inline mesos::v1::Offer::Operation RESERVE(Args&&... args)
 template <typename... Args>
 inline mesos::v1::Offer::Operation UNRESERVE(Args&&... args)
 {
-  return common::UNRESERVE<mesos::v1::Resources, mesos::v1::Offer>(
-      std::forward<Args>(args)...);
+  return common::UNRESERVE<
+      mesos::v1::Resources,
+      mesos::v1::OperationID,
+      mesos::v1::Offer>(std::forward<Args>(args)...);
 }
 
 
 template <typename... Args>
 inline mesos::v1::Offer::Operation CREATE(Args&&... args)
 {
-  return common::CREATE<mesos::v1::Resources, mesos::v1::Offer>(
-      std::forward<Args>(args)...);
+  return common::CREATE<
+      mesos::v1::Resources,
+      mesos::v1::OperationID,
+      mesos::v1::Offer>(std::forward<Args>(args)...);
 }
 
 
 template <typename... Args>
 inline mesos::v1::Offer::Operation DESTROY(Args&&... args)
 {
-  return common::DESTROY<mesos::v1::Resources, mesos::v1::Offer>(
-      std::forward<Args>(args)...);
+  return common::DESTROY<
+      mesos::v1::Resources,
+      mesos::v1::OperationID,
+      mesos::v1::Offer>(std::forward<Args>(args)...);
 }
 
 
 template <typename... Args>
 inline mesos::v1::Offer::Operation GROW_VOLUME(Args&&... args)
 {
-  return common::GROW_VOLUME<mesos::v1::Resource, mesos::v1::Offer>(
-      std::forward<Args>(args)...);
+  return common::GROW_VOLUME<
+      mesos::v1::Resource,
+      mesos::v1::OperationID,
+      mesos::v1::Offer>(std::forward<Args>(args)...);
 }
 
 
 template <typename... Args>
 inline mesos::v1::Offer::Operation SHRINK_VOLUME(Args&&... args)
 {
-  return common::SHRINK_VOLUME<mesos::v1::Resource, mesos::v1::Offer>(
-      std::forward<Args>(args)...);
+  return common::SHRINK_VOLUME<
+      mesos::v1::Resource,
+      mesos::v1::Value::Scalar,
+      mesos::v1::OperationID,
+      mesos::v1::Offer>(std::forward<Args>(args)...);
 }
 
 
@@ -2367,7 +2494,6 @@ ACTION_P5(LaunchTasks, executor, tasks, cpus, mem, role)
       taskResources.allocate(role);
     }
 
-    int nextTaskId = 0;
     std::vector<TaskInfo> tasks;
     Resources remaining = offer.resources();
 
@@ -2375,7 +2501,7 @@ ACTION_P5(LaunchTasks, executor, tasks, cpus, mem, role)
            launched < numTasks) {
       TaskInfo task;
       task.set_name("TestTask");
-      task.mutable_task_id()->set_value(stringify(nextTaskId++));
+      task.mutable_task_id()->set_value(id::UUID::random().toString());
       task.mutable_slave_id()->MergeFrom(offer.slave_id());
       task.mutable_executor()->MergeFrom(executor);
 
@@ -2747,6 +2873,24 @@ ACTION_P2(SendAcknowledge, frameworkId, agentId)
 }
 
 
+ACTION_P2(
+    SendAcknowledgeOperationStatus, frameworkId, agentId)
+{
+  Call call;
+  call.set_type(Call::ACKNOWLEDGE_OPERATION_STATUS);
+  call.mutable_framework_id()->CopyFrom(frameworkId);
+
+  Call::AcknowledgeOperationStatus* acknowledge =
+    call.mutable_acknowledge_operation_status();
+
+  acknowledge->mutable_agent_id()->CopyFrom(agentId);
+  acknowledge->set_uuid(arg1.status().uuid().value());
+  acknowledge->mutable_operation_id()->CopyFrom(arg1.status().operation_id());
+
+  arg0->send(call);
+}
+
+
 ACTION_P3(
     SendAcknowledgeOperationStatus, frameworkId, agentId, resourceProviderId)
 {
@@ -2950,51 +3094,71 @@ template <
     typename Call,
     typename Driver,
     typename ResourceProviderInfo,
+    typename ResourceProviderID,
     typename Resource,
     typename Resources,
-    typename ResourceProviderID,
     typename OperationState,
-    typename Operation,
-    typename Source>
-class MockResourceProvider
-{
-  using MockResourceProviderT = MockResourceProvider<
+    typename Operation>
+class TestResourceProviderProcess :
+  public process::Process<TestResourceProviderProcess<
       Event,
       Call,
       Driver,
       ResourceProviderInfo,
+      ResourceProviderID,
       Resource,
       Resources,
-      ResourceProviderID,
       OperationState,
-      Operation,
-      Source>;
-
+      Operation>>
+{
 public:
-  MockResourceProvider(
+  TestResourceProviderProcess(
       const ResourceProviderInfo& _info,
       const Option<Resources>& _resources = None())
-    : info(_info),
+    : process::ProcessBase(process::ID::generate("test-resource-provider")),
+      info(_info),
       resources(_resources)
   {
-    ON_CALL(*this, connected())
-      .WillByDefault(Invoke(this, &MockResourceProviderT::connectedDefault));
+    auto self = this->self();
+
+    ON_CALL(*this, connected()).WillByDefault(Invoke([self]() {
+      dispatch(self, &TestResourceProviderProcess::connectedDefault);
+    }));
     EXPECT_CALL(*this, connected()).WillRepeatedly(DoDefault());
 
     ON_CALL(*this, subscribed(_))
-      .WillByDefault(Invoke(this, &MockResourceProviderT::subscribedDefault));
+      .WillByDefault(
+          Invoke([self](const typename Event::Subscribed& subscribed) {
+            dispatch(
+                self,
+                &TestResourceProviderProcess::subscribedDefault,
+                subscribed);
+          }));
     EXPECT_CALL(*this, subscribed(_)).WillRepeatedly(DoDefault());
 
     ON_CALL(*this, applyOperation(_))
-      .WillByDefault(Invoke(this, &MockResourceProviderT::operationDefault));
+      .WillByDefault(
+          Invoke([self](const typename Event::ApplyOperation& operation) {
+            dispatch(
+                self,
+                &TestResourceProviderProcess::operationDefault,
+                operation);
+          }));
     EXPECT_CALL(*this, applyOperation(_)).WillRepeatedly(DoDefault());
 
     ON_CALL(*this, publishResources(_))
-      .WillByDefault(Invoke(this, &MockResourceProviderT::publishDefault));
+      .WillByDefault(
+          Invoke([self](const typename Event::PublishResources& publish) {
+            dispatch(
+                self,
+                &TestResourceProviderProcess::publishDefault,
+                publish);
+          }));
     EXPECT_CALL(*this, publishResources(_)).WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, teardown())
-      .WillByDefault(Invoke(this, &MockResourceProviderT::teardownDefault));
+    ON_CALL(*this, teardown()).WillByDefault(Invoke([self]() {
+      dispatch(self, &TestResourceProviderProcess::teardownDefault);
+    }));
     EXPECT_CALL(*this, teardown()).WillRepeatedly(DoDefault());
   }
 
@@ -3017,6 +3181,7 @@ public:
   {
     while (!events.empty()) {
       Event event = events.front();
+
       events.pop();
 
       switch (event.type()) {
@@ -3047,14 +3212,18 @@ public:
 
   process::Future<Nothing> send(const Call& call)
   {
-    return driver->send(call);
+    if (driver != nullptr) {
+      return driver->send(call);
+    } else {
+      return process::Failure("Cannot send call since driver is torn down");
+    }
   }
 
   void start(
       process::Owned<mesos::internal::EndpointDetector> detector,
       ContentType contentType)
   {
-    Option<std::string> token;
+    process::Future<Option<std::string>> token = None();
 
 #ifdef USE_SSL_SOCKET
     mesos::authentication::executor::JWTSecretGenerator secretGenerator(
@@ -3071,20 +3240,31 @@ public:
 
     process::Future<Secret> secret = secretGenerator.generate(principal);
 
-    AWAIT_READY(secret);
-
-    token = secret->value().data();
+    token = secretGenerator.generate(principal).then(
+        [](const Secret& secret) -> Option<std::string> {
+          return secret.value().data();
+        });
 #endif // USE_SSL_SOCKET
 
-    driver.reset(new Driver(
-      std::move(detector),
-      contentType,
-      lambda::bind(&MockResourceProviderT::connected, this),
-      lambda::bind(&MockResourceProviderT::disconnected, this),
-      lambda::bind(&MockResourceProviderT::events, this, lambda::_1),
-      token));
+    // TODO(bbannier): Remove the `shared_ptr` once we get C++14.
+    auto detector_ =
+      std::make_shared<process::Owned<EndpointDetector>>(std::move(detector));
 
-    driver->start();
+    token.then(defer(this->self(), [=](const Option<std::string>& token) {
+      driver.reset(new Driver(
+          std::move(*detector_),
+          contentType,
+          process::defer(this->self(), &TestResourceProviderProcess::connected),
+          process::defer(
+              this->self(), &TestResourceProviderProcess::disconnected),
+          process::defer(
+              this->self(), &TestResourceProviderProcess::events, lambda::_1),
+          token));
+
+      driver->start();
+
+      return Nothing();
+    }));
   }
 
   void stop()
@@ -3094,26 +3274,21 @@ public:
 
   void connectedDefault()
   {
-    // Do nothing if this is asynchronously called after `stop` is invoked.
-    if (driver == nullptr) {
-      return;
-    }
-
     Call call;
     call.set_type(Call::SUBSCRIBE);
     call.mutable_subscribe()->mutable_resource_provider_info()->CopyFrom(info);
 
-    driver->send(call);
+    send(call)
+      .onFailed([](const std::string& failure) {
+        LOG(INFO) << "Failed to send call: " << failure;
+      });
   }
 
   void subscribedDefault(const typename Event::Subscribed& subscribed)
   {
-    // Do nothing if this is asynchronously called after `stop` is invoked.
-    if (driver == nullptr) {
-      return;
-    }
-
     info.mutable_id()->CopyFrom(subscribed.provider_id());
+
+    providerId.set(subscribed.provider_id());
 
     if (resources.isSome()) {
       Resources injected;
@@ -3132,17 +3307,15 @@ public:
       update->mutable_resource_version_uuid()->set_value(
           id::UUID::random().toBytes());
 
-      driver->send(call);
+      send(call)
+        .onFailed([](const std::string& failure) {
+          LOG(INFO) << "Failed to send call: " << failure;
+        });
     }
   }
 
   void operationDefault(const typename Event::ApplyOperation& operation)
   {
-    // Do nothing if this is asynchronously called after `stop` is invoked.
-    if (driver == nullptr) {
-      return;
-    }
-
     CHECK(info.has_id());
 
     Call call;
@@ -3198,7 +3371,7 @@ public:
           ->mutable_converted_resources(0)
           ->mutable_disk()
           ->mutable_source()
-          ->set_type(Source::RAW);
+          ->set_type(Resource::DiskInfo::Source::RAW);
         break;
       case Operation::UNKNOWN:
         break;
@@ -3212,16 +3385,14 @@ public:
 
     update->mutable_latest_status()->CopyFrom(update->status());
 
-    driver->send(call);
+    send(call)
+      .onFailed([](const std::string& failure) {
+        LOG(INFO) << "Failed to send call: " << failure;
+      });
   }
 
   void publishDefault(const typename Event::PublishResources& publish)
   {
-    // Do nothing if this is asynchronously called after `stop` is invoked.
-    if (driver == nullptr) {
-      return;
-    }
-
     CHECK(info.has_id());
 
     Call call;
@@ -3233,16 +3404,82 @@ public:
     update->mutable_uuid()->CopyFrom(publish.uuid());
     update->set_status(Call::UpdatePublishResourcesStatus::OK);
 
-    driver->send(call);
+    send(call)
+      .onFailed([](const std::string& failure) {
+        LOG(INFO) << "Failed to send call: " << failure;
+      });
   }
 
   void teardownDefault() {}
 
-  ResourceProviderInfo info;
+  process::Future<ResourceProviderID> id() const { return providerId.future(); }
 
 private:
+  ResourceProviderInfo info;
+
   Option<Resources> resources;
   std::unique_ptr<Driver> driver;
+
+  process::Promise<ResourceProviderID> providerId;
+};
+
+template <
+    typename Event,
+    typename Call,
+    typename Driver,
+    typename ResourceProviderInfo,
+    typename ResourceProviderID,
+    typename Resource,
+    typename Resources,
+    typename OperationState,
+    typename Operation>
+class TestResourceProvider
+{
+public:
+  TestResourceProvider(
+      const ResourceProviderInfo& _info,
+      const Option<Resources>& _resources = None())
+    : process(new TestResourceProviderProcessT(_info, _resources))
+  {
+    process::spawn(*process);
+  }
+
+  ~TestResourceProvider()
+  {
+    process::terminate(*process);
+    process::wait(*process);
+  }
+
+  void start(
+      process::Owned<mesos::internal::EndpointDetector> detector,
+      ContentType contentType)
+  {
+    process::dispatch(
+        *process,
+        &TestResourceProviderProcessT::start,
+        std::move(detector),
+        contentType);
+  }
+
+  process::Future<Nothing> send(const Call& call)
+  {
+    return process::dispatch(
+        *process, &TestResourceProviderProcessT::send, call);
+  }
+
+  // Made public for mocking.
+  using TestResourceProviderProcessT = TestResourceProviderProcess<
+      mesos::v1::resource_provider::Event,
+      mesos::v1::resource_provider::Call,
+      mesos::v1::resource_provider::Driver,
+      mesos::v1::ResourceProviderInfo,
+      mesos::v1::ResourceProviderID,
+      mesos::v1::Resource,
+      mesos::v1::Resources,
+      mesos::v1::OperationState,
+      mesos::v1::Offer::Operation>;
+
+  std::unique_ptr<TestResourceProviderProcessT> process;
 };
 
 inline process::Owned<EndpointDetector> createEndpointDetector(
@@ -3279,17 +3516,28 @@ using Event = mesos::v1::resource_provider::Event;
 
 } // namespace resource_provider {
 
-using MockResourceProvider = tests::resource_provider::MockResourceProvider<
+using TestResourceProviderProcess =
+  tests::resource_provider::TestResourceProviderProcess<
+      mesos::v1::resource_provider::Event,
+      mesos::v1::resource_provider::Call,
+      mesos::v1::resource_provider::Driver,
+      mesos::v1::ResourceProviderInfo,
+      mesos::v1::ResourceProviderID,
+      mesos::v1::Resource,
+      mesos::v1::Resources,
+      mesos::v1::OperationState,
+      mesos::v1::Offer::Operation>;
+
+using TestResourceProvider = tests::resource_provider::TestResourceProvider<
     mesos::v1::resource_provider::Event,
     mesos::v1::resource_provider::Call,
     mesos::v1::resource_provider::Driver,
     mesos::v1::ResourceProviderInfo,
+    mesos::v1::ResourceProviderID,
     mesos::v1::Resource,
     mesos::v1::Resources,
-    mesos::v1::ResourceProviderID,
     mesos::v1::OperationState,
-    mesos::v1::Offer::Operation,
-    mesos::v1::Resource::DiskInfo::Source>;
+    mesos::v1::Offer::Operation>;
 
 } // namespace v1 {
 
@@ -3668,9 +3916,9 @@ MATCHER_P(OffersHaveResource, resource, "")
 
 
 // This matcher is used to match the task id of a `TaskStatus` message.
-MATCHER_P(TaskStatusTaskIdEq, taskInfo, "")
+MATCHER_P(TaskStatusTaskIdEq, taskId, "")
 {
-  return arg.task_id() == taskInfo.task_id();
+  return arg.task_id() == taskId;
 }
 
 
@@ -3683,9 +3931,9 @@ MATCHER_P(TaskStatusStateEq, taskState, "")
 
 // This matcher is used to match the task id of an `Event.update.status`
 // message.
-MATCHER_P(TaskStatusUpdateTaskIdEq, taskInfo, "")
+MATCHER_P(TaskStatusUpdateTaskIdEq, taskId, "")
 {
-  return arg.status().task_id() == taskInfo.task_id();
+  return arg.status().task_id() == taskId;
 }
 
 
@@ -3694,14 +3942,6 @@ MATCHER_P(TaskStatusUpdateTaskIdEq, taskInfo, "")
 MATCHER_P(TaskStatusUpdateStateEq, taskState, "")
 {
   return arg.status().state() == taskState;
-}
-
-
-// This matcher is used to match an `Event.update.status` message whose state is
-// terminal.
-MATCHER(TaskStatusUpdateIsTerminalState, "")
-{
-  return protobuf::isTerminalState(devolve(arg.status()).state());
 }
 
 
@@ -3788,6 +4028,24 @@ private:
   ParamExecutorType(Type _type) : type(_type) {}
 
   Type type;
+};
+
+
+struct ParamDiskQuota
+{
+  enum Type
+  {
+    SANDBOX,
+    ROOTFS,
+  };
+
+  struct Printer
+  {
+    std::string operator()(
+        const ::testing::TestParamInfo<ParamDiskQuota::Type>& info) const;
+  };
+
+  static std::vector<Type> parameters();
 };
 
 } // namespace tests {

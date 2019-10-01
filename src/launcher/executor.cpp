@@ -494,6 +494,9 @@ protected:
 
     if (taskLaunchInfo.isSome()) {
       launchInfo.mutable_mounts()->CopyFrom(taskLaunchInfo->mounts());
+      launchInfo.mutable_file_operations()->CopyFrom(
+          taskLaunchInfo->file_operations());
+
       launchInfo.mutable_pre_exec_commands()->CopyFrom(
           taskLaunchInfo->pre_exec_commands());
 
@@ -686,6 +689,15 @@ protected:
         environment[name] = variable;
       }
     }
+
+    // Set the `MESOS_ALLOCATION_ROLE` environment variable for the task.
+    // Please note that tasks are not allowed to mix resources allocated
+    // to different roles, see MESOS-6636.
+    Environment::Variable variable;
+    variable.set_name("MESOS_ALLOCATION_ROLE");
+    variable.set_type(Environment::Variable::VALUE);
+    variable.set_value(task.resources().begin()->allocation_info().role());
+    environment["MESOS_ALLOCATION_ROLE"] = variable;
 
     Environment launchEnvironment;
     foreachvalue (const Environment::Variable& variable, environment) {

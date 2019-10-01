@@ -55,6 +55,7 @@ namespace paths {
 // File names.
 const char BOOT_ID_FILE[] = "boot_id";
 const char SLAVE_INFO_FILE[] = "slave.info";
+const char DRAIN_CONFIG_FILE[] = "drain.config";
 const char FRAMEWORK_PID_FILE[] = "framework.pid";
 const char FRAMEWORK_INFO_FILE[] = "framework.info";
 const char LIBPROCESS_PID_FILE[] = "libprocess.pid";
@@ -65,6 +66,7 @@ const char FORKED_PID_FILE[] = "forked.pid";
 const char TASK_INFO_FILE[] = "task.info";
 const char TASK_UPDATES_FILE[] = "task.updates";
 const char RESOURCE_STATE_FILE[] = "resources_and_operations.state";
+const char RESOURCE_STATE_TARGET_FILE[] = "resources_and_operations.target";
 const char RESOURCES_INFO_FILE[] = "resources.info";
 const char RESOURCES_TARGET_FILE[] = "resources.target";
 const char RESOURCE_PROVIDER_STATE_FILE[] = "resource_provider.state";
@@ -644,6 +646,12 @@ string getResourceStatePath(const string& rootDir)
 }
 
 
+string getResourceStateTargetPath(const string& rootDir)
+{
+  return path::join(rootDir, "resources", RESOURCE_STATE_TARGET_FILE);
+}
+
+
 string getResourcesInfoPath(
     const string& rootDir)
 {
@@ -655,6 +663,14 @@ string getResourcesTargetPath(
     const string& rootDir)
 {
   return path::join(rootDir, "resources", RESOURCES_TARGET_FILE);
+}
+
+
+string getDrainConfigPath(
+    const string& metaDir,
+    const SlaveID& slaveId)
+{
+  return path::join(getSlavePath(metaDir, slaveId), DRAIN_CONFIG_FILE);
 }
 
 

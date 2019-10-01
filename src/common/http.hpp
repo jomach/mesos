@@ -189,7 +189,6 @@ JSON::Object model(const ExecutorInfo& executorInfo);
 JSON::Array model(const Labels& labels);
 JSON::Object model(const Task& task);
 JSON::Object model(const FileInfo& fileInfo);
-JSON::Object model(const quota::QuotaInfo& quotaInfo);
 
 void json(JSON::ObjectWriter* writer, const Task& task);
 
@@ -210,6 +209,8 @@ void json(JSON::ObjectWriter* writer, const Resources& resources);
 void json(
     JSON::ObjectWriter* writer,
     const google::protobuf::RepeatedPtrField<Resource>& resources);
+void json(JSON::ObjectWriter* writer, const ResourceQuantities& quantities);
+void json(JSON::ObjectWriter* writer, const ResourceLimits& limits);
 void json(JSON::ObjectWriter* writer, const SlaveInfo& slaveInfo);
 void json(
     JSON::StringWriter* writer, const SlaveInfo::Capability& capability);

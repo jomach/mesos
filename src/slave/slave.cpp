@@ -198,6 +198,7 @@ Slave::Slave(const string& id,
              QoSController* _qosController,
              SecretGenerator* _secretGenerator,
              VolumeGidManager* _volumeGidManager,
+             PendingFutureTracker* _futureTracker,
              const Option<Authorizer*>& _authorizer)
   : ProcessBase(id),
     state(RECOVERING),
@@ -228,6 +229,7 @@ Slave::Slave(const string& id,
     qosController(_qosController),
     secretGenerator(_secretGenerator),
     volumeGidManager(_volumeGidManager),
+    futureTracker(_futureTracker),
     authorizer(_authorizer),
     resourceVersion(protobuf::createUUID()) {}
 
@@ -749,6 +751,8 @@ void Slave::initialize()
       &Slave::shutdown,
       &ShutdownMessage::message);
 
+  install<DrainSlaveMessage>(&Slave::drain);
+
   install<PingSlaveMessage>(
       &Slave::ping,
       &PingSlaveMessage::connected);
@@ -833,6 +837,14 @@ void Slave::initialize()
             .onReady([request](const process::http::Response& response) {
               logResponse(request, response);
             });
+        });
+  route("/containerizer/debug",
+        READONLY_HTTP_AUTHENTICATION_REALM,
+        Http::CONTAINERIZER_DEBUG_HELP(),
+        [this](const http::Request& request,
+               const Option<Principal>& principal) {
+          logRequest(request);
+          return http.containerizerDebug(request, principal);
         });
 
   // TODO(tillt): Use generalized lambda capture once we adopt C++14.
@@ -977,6 +989,87 @@ void Slave::shutdown(const UPID& from, const string& message)
     // can potentially remove a framework from 'frameworks'.
     foreach (const FrameworkID& frameworkId, frameworks.keys()) {
       shutdownFramework(from, frameworkId);
+    }
+  }
+}
+
+
+void Slave::drain(
+    const UPID& from,
+    DrainSlaveMessage&& drainSlaveMessage)
+{
+  LOG(INFO)
+    << "Checkpointing DrainConfig. Previous drain config was "
+    << (drainConfig.isSome() ? stringify(drainConfig.get()) : "NONE")
+    << ", new drain config is " << drainSlaveMessage.config();
+
+  CHECK_SOME(state::checkpoint(
+      paths::getDrainConfigPath(metaDir, info.id()),
+      drainSlaveMessage.config()))
+    << "Failed to checkpoint DrainConfig";
+
+  drainConfig = drainSlaveMessage.config();
+  estimatedDrainStartTime = Clock::now();
+
+  const Option<DurationInfo> maxGracePeriod =
+    drainConfig->has_max_grace_period()
+      ? drainConfig->max_grace_period()
+      : Option<DurationInfo>::none();
+
+  auto calculateKillPolicy =
+    [&](const Option<KillPolicy>& killPolicy) -> Option<KillPolicy> {
+      if (maxGracePeriod.isNone()) {
+        return None();
+      }
+
+      KillPolicy killPolicyOverride;
+      killPolicyOverride.mutable_grace_period()->CopyFrom(maxGracePeriod.get());
+
+      // Task kill policy is not set or unknown.
+      if (killPolicy.isNone() || !killPolicy->has_grace_period()) {
+        return killPolicyOverride;
+      }
+
+      // Task kill policy is greater than the override.
+      if (maxGracePeriod.get() < killPolicy->grace_period()) {
+        return killPolicyOverride;
+      }
+
+      return None();
+    };
+
+  // Frameworks may be removed within `kill()` or `killPendingTask()` below,
+  // so we must copy them and their members before looping.
+  foreachvalue (Framework* framework, utils::copy(frameworks)) {
+    typedef hashmap<TaskID, TaskInfo> TaskMap;
+    foreachvalue (const TaskMap& tasks, utils::copy(framework->pendingTasks)) {
+      foreachvalue (const TaskInfo& task, tasks) {
+        killPendingTask(framework->id(), framework, task.task_id());
+      }
+    }
+
+    foreachvalue (Executor* executor, utils::copy(framework->executors)) {
+      foreachvalue (Task* task, executor->launchedTasks) {
+        kill(framework->id(),
+             framework,
+             executor,
+             task->task_id(),
+             calculateKillPolicy(
+                task->has_kill_policy()
+                  ? task->kill_policy()
+                  : Option<KillPolicy>::none()));
+      }
+
+      foreachvalue (const TaskInfo& task, utils::copy(executor->queuedTasks)) {
+        kill(framework->id(),
+             framework,
+             executor,
+             task.task_id(),
+             calculateKillPolicy(
+                task.has_kill_policy()
+                  ? task.kill_policy()
+                  : Option<KillPolicy>::none()));
+      }
     }
   }
 }
@@ -2654,17 +2747,51 @@ void Slave::__run(
     CHECK(framework->removePendingTask(_task.task_id()));
   }
 
-  // Check task invariants.
+  // Check task launch invariants.
   //
   // TODO(bbannier): Instead of copy-pasting identical code to deal
   // with cases where tasks need to be terminated, consolidate code
   // below to decouple checking from terminating.
+  Option<string> kill = None();
+
+  // Fail the launch if the agent is draining.
+  if (drainConfig.isSome()) {
+    LOG(WARNING) << "Ignoring running " << taskOrTaskGroup(task, taskGroup)
+                 << " of framework " << frameworkId
+                 << " because the agent is draining";
+
+    kill = "Task was received while agent was already draining";
+  }
+
+  if (kill.isSome()) {
+    sendTaskDroppedUpdate(TaskStatus::REASON_SLAVE_DRAINING, *kill);
+
+    // Refer to the comment after 'framework->removePendingTask' above
+    // for why we need this.
+    if (framework->idle()) {
+      removeFramework(framework);
+    }
+
+    if (launchExecutor.isSome() && launchExecutor.get()) {
+      // Master expects a new executor to be launched for this task(s).
+      // To keep the master executor entries updated, the agent needs to send
+      // `ExitedExecutorMessage` even though no executor launched.
+      sendExitedExecutorMessage(frameworkId, executorInfo.executor_id());
+
+      // See the declaration of `taskLaunchSequences` regarding its lifecycle
+      // management.
+      framework->taskLaunchSequences.erase(executorInfo.executor_id());
+    }
+
+    return;
+  }
+
+  CHECK_NONE(kill);
 
   // If the master sent resource versions, perform a best-effort check
   // that they are consistent with the resources the task uses.
   //
   // TODO(bbannier): Also check executor resources.
-  bool kill = false;
   if (!resourceVersionUuids.empty()) {
     hashset<Option<ResourceProviderID>> usedResourceProviderIds;
     foreach (const TaskInfo& _task, tasks) {
@@ -2685,7 +2812,7 @@ void Slave::__run(
         CHECK(receivedResourceVersions.contains(None()));
 
         if (resourceVersion != receivedResourceVersions.at(None())) {
-          kill = true;
+          kill = "Task assumes outdated resource state";
         }
       } else {
         ResourceProvider* resourceProvider =
@@ -2694,16 +2821,14 @@ void Slave::__run(
         if (resourceProvider == nullptr ||
             resourceProvider->resourceVersion !=
               receivedResourceVersions.at(resourceProviderId.get())) {
-          kill = true;
+          kill = "Task assumes outdated resource state";
         }
       }
     }
   }
 
-  if (kill) {
-    sendTaskDroppedUpdate(
-        TaskStatus::REASON_INVALID_OFFERS,
-        "Task assumes outdated resource state");
+  if (kill.isSome()) {
+    sendTaskDroppedUpdate(TaskStatus::REASON_INVALID_OFFERS, *kill);
 
     // Refer to the comment after 'framework->removePendingTask' above
     // for why we need this.
@@ -2731,7 +2856,7 @@ void Slave::__run(
     return result;
   };
 
-  CHECK_EQ(kill, false);
+  CHECK_NONE(kill);
 
   // NOTE: If the task/task group or executor uses resources that are
   // checkpointed on the slave (e.g. persistent volumes), we should
@@ -2752,17 +2877,16 @@ void Slave::__run(
                      << " for task " << _task
                      << " of framework " << frameworkId;
 
-        kill = true;
+        kill =
+          "The checkpointed resources being used by the task or task group are "
+          "unknown to the agent";
         break;
       }
     }
   }
 
-  if (kill) {
-    sendTaskDroppedUpdate(
-        TaskStatus::REASON_RESOURCES_UNKNOWN,
-        "The checkpointed resources being used by the task or task group are "
-        "unknown to the agent");
+  if (kill.isSome()) {
+    sendTaskDroppedUpdate(TaskStatus::REASON_RESOURCES_UNKNOWN, *kill);
 
     // Refer to the comment after 'framework->removePendingTask' above
     // for why we need this.
@@ -2784,7 +2908,7 @@ void Slave::__run(
     return;
   }
 
-  CHECK_EQ(kill, false);
+  CHECK_NONE(kill);
 
   // Refer to the comment above when looping across tasks on
   // why we need to unallocate resources.
@@ -2797,16 +2921,15 @@ void Slave::__run(
                    << " for executor '" << executorId
                    << "' of framework " << frameworkId;
 
-      kill = true;
+      kill =
+        "The checkpointed resources being used by the executor are unknown "
+        "to the agent";
       break;
     }
   }
 
-  if (kill) {
-    sendTaskDroppedUpdate(
-        TaskStatus::REASON_RESOURCES_UNKNOWN,
-        "The checkpointed resources being used by the executor are unknown "
-        "to the agent");
+  if (kill.isSome()) {
+    sendTaskDroppedUpdate(TaskStatus::REASON_RESOURCES_UNKNOWN, *kill);
 
     // Refer to the comment after 'framework->removePendingTask' above
     // for why we need this.
@@ -2987,14 +3110,20 @@ void Slave::__run(
         defaultExecutorCommandInfo(flags.launcher_dir, executor->user);
     }
 
-    // NOTE: We modify the ExecutorInfo to include the task's resources when
-    // launching the executor so that the containerizer has non-zero resources
-    // to work with when the executor has no resources. This should be revisited
-    // after MESOS-600.
-    if (task.isSome()) {
-      *executorInfo_.mutable_resources() =
-        Resources(executorInfo.resources()) + task->resources();
+    // We modify the ExecutorInfo to include the task/task group's resources
+    // when launching the executor so that the containerizer has non-zero
+    // resources to work with when the executor has no resources. And this is
+    // also helpful for the executor to have enough resources to start because
+    // usually the resources that framework gives to executor are pretty small
+    // (e.g., Marathon/mesos-execute give 0.1 CPUs to the default executor) so
+    // the executor may be throttled by CFS, see MESOS-9925 for details.
+    Resources tasksResources;
+    foreach (const TaskInfo& _task, tasks) {
+      tasksResources += _task.resources();
     }
+
+    *executorInfo_.mutable_resources() =
+      Resources(executorInfo.resources()) + tasksResources;
 
     // Add the default container info to the executor info.
     // TODO(jieyu): Rename the flag to be default_mesos_container_info.
@@ -3650,10 +3779,6 @@ void Slave::killTask(
     return;
   }
 
-  CHECK(framework->state == Framework::RUNNING ||
-        framework->state == Framework::TERMINATING)
-    << framework->state;
-
   // We don't send a status update here because a terminating
   // framework cannot send acknowledgements.
   if (framework->state == Framework::TERMINATING) {
@@ -3663,54 +3788,10 @@ void Slave::killTask(
     return;
   }
 
-  // If the task is pending, we send a TASK_KILLED immediately.
-  // This will trigger a synchronous removal of the pending task,
-  // which prevents it from being launched.
+  CHECK(framework->state == Framework::RUNNING) << framework->state;
+
   if (framework->isPending(taskId)) {
-    LOG(WARNING) << "Killing task " << taskId
-                 << " of framework " << frameworkId
-                 << " before it was launched";
-
-    Option<TaskGroupInfo> taskGroup =
-      framework->getTaskGroupForPendingTask(taskId);
-
-    vector<StatusUpdate> updates;
-    if (taskGroup.isSome()) {
-      foreach (const TaskInfo& task, taskGroup->tasks()) {
-        updates.push_back(protobuf::createStatusUpdate(
-            frameworkId,
-            info.id(),
-            task.task_id(),
-            TASK_KILLED,
-            TaskStatus::SOURCE_SLAVE,
-            id::UUID::random(),
-            "A task within the task group was killed before"
-            " delivery to the executor",
-            TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
-            CHECK_NOTNONE(
-                framework->getExecutorIdForPendingTask(task.task_id()))));
-      }
-    } else {
-      updates.push_back(protobuf::createStatusUpdate(
-          frameworkId,
-          info.id(),
-          taskId,
-          TASK_KILLED,
-          TaskStatus::SOURCE_SLAVE,
-          id::UUID::random(),
-          "Killed before delivery to the executor",
-          TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
-          CHECK_NOTNONE(
-              framework->getExecutorIdForPendingTask(taskId))));
-    }
-
-    foreach (const StatusUpdate& update, updates) {
-      // NOTE: Sending a terminal update (TASK_KILLED) synchronously
-      // removes the task/task group from 'framework->pendingTasks'
-      // and 'framework->pendingTaskGroups', so that it will not be
-      // launched.
-      statusUpdate(update, UPID());
-    }
+    killPendingTask(frameworkId, framework, taskId);
 
     return;
   }
@@ -3742,6 +3823,80 @@ void Slave::killTask(
     statusUpdate(update, UPID());
     return;
   }
+
+  kill(frameworkId,
+       framework,
+       executor,
+       taskId,
+       (killTaskMessage.has_kill_policy()
+          ? killTaskMessage.kill_policy()
+          : Option<KillPolicy>::none()));
+}
+
+
+void Slave::killPendingTask(
+    const FrameworkID& frameworkId,
+    Framework* framework,
+    const TaskID& taskId)
+{
+  LOG(WARNING) << "Killing task " << taskId
+               << " of framework " << frameworkId
+               << " before it was launched";
+
+  Option<TaskGroupInfo> taskGroup =
+    framework->getTaskGroupForPendingTask(taskId);
+
+  vector<StatusUpdate> updates;
+  if (taskGroup.isSome()) {
+    foreach (const TaskInfo& task, taskGroup->tasks()) {
+      updates.push_back(protobuf::createStatusUpdate(
+          frameworkId,
+          info.id(),
+          task.task_id(),
+          TASK_KILLED,
+          TaskStatus::SOURCE_SLAVE,
+          id::UUID::random(),
+          "A task within the task group was killed before"
+          " delivery to the executor",
+          TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
+          CHECK_NOTNONE(
+              framework->getExecutorIdForPendingTask(task.task_id()))));
+    }
+  } else {
+    updates.push_back(protobuf::createStatusUpdate(
+        frameworkId,
+        info.id(),
+        taskId,
+        TASK_KILLED,
+        TaskStatus::SOURCE_SLAVE,
+        id::UUID::random(),
+        "Killed before delivery to the executor",
+        TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH,
+        CHECK_NOTNONE(
+            framework->getExecutorIdForPendingTask(taskId))));
+  }
+
+  foreach (const StatusUpdate& update, updates) {
+    // NOTE: Sending a terminal update (TASK_KILLED) synchronously
+    // removes the task/task group from 'framework->pendingTasks'
+    // and 'framework->pendingTaskGroups', so that it will not be
+    // launched.
+    statusUpdate(update, UPID());
+  }
+}
+
+
+void Slave::kill(
+    const FrameworkID& frameworkId,
+    Framework* framework,
+    Executor* executor,
+    const TaskID& taskId,
+    const Option<KillPolicy>& killPolicy)
+{
+  // This function should only be called on tasks which are queued or launched,
+  // so both the framework and executor should always exist.
+  CHECK_NOTNULL(framework);
+  CHECK_NOTNULL(executor);
 
   switch (executor->state) {
     case Executor::REGISTERING: {
@@ -3868,9 +4023,8 @@ void Slave::killTask(
         KillTaskMessage message;
         message.mutable_framework_id()->MergeFrom(frameworkId);
         message.mutable_task_id()->MergeFrom(taskId);
-        if (killTaskMessage.has_kill_policy()) {
-          message.mutable_kill_policy()->MergeFrom(
-              killTaskMessage.kill_policy());
+        if (killPolicy.isSome()) {
+          message.mutable_kill_policy()->MergeFrom(killPolicy.get());
         }
 
         executor->send(message);
@@ -4227,22 +4381,34 @@ void Slave::checkpointResourceState(
     totalResources = _totalResources.get();
   }
 
-  // Store the target checkpoint resources. We commit the checkpoint
-  // only after all operations are successful. If any of the operations
-  // fail, the agent exits and the update to checkpointed resources
+  // Store the target checkpoint resources. We commit the checkpoint by renaming
+  // the target file only after all operations are successful. If any of the
+  // operations fail, the agent exits and the update to checkpointed resources
   // is re-attempted after the agent restarts before agent reregistration.
   //
   // Since we commit the checkpoint after all operations are successful,
   // we avoid a case of inconsistency between the master and the agent if
-  // the agent restarts during handling of CheckpointResourcesMessage.
+  // the agent restarts during handling of `CheckpointResourcesMessage`.
+  //
+  // NOTE: Since the addition of operation feedback on the agent, the resources
+  // are checkpointed in two formats:
+  // 1) Pre-operation-feedback, where only resources are written to a target
+  //    file, then moved to the final checkpoint location once any persistent
+  //    volumes have been committed to disk.
+  // 2) Post-operation-feedback, where both resources and operations are written
+  //    to a target file, then moved to the final checkpoint location once any
+  //    persistent volumes have been committed to disk.
+  //
+  // Both of these formats continue to be written to disk in order to permit
+  // agent downgrades.
 
   CHECK_SOME(state::checkpoint(
-      paths::getResourceStatePath(metaDir),
+      paths::getResourceStateTargetPath(metaDir),
       resourceState,
       false,
       false))
     << "Failed to checkpoint resources " << resourceState.resources()
-    << " and operations " << resourceState.operations();
+    << " and operations " << resourceState.operations() << "to target file";
 
   if (resourcesToCheckpoint != checkpointedResources) {
     CHECK_SOME(state::checkpoint(
@@ -4276,6 +4442,22 @@ void Slave::checkpointResourceState(
               << resourcesToCheckpoint;
 
     checkpointedResources = std::move(resourcesToCheckpoint);
+  }
+
+  // At this point, `syncCheckpointedResources()` has ensured that any change in
+  // checkpointed resources (e.g. persistent volumes) is now reflected on disk.
+  // We rename the target resource state file to the actual resource state file,
+  // which is our source of truth for the current state of the agent resources.
+  Try<Nothing> renameResult = os::rename(
+      paths::getResourceStateTargetPath(metaDir),
+      paths::getResourceStatePath(metaDir));
+
+  if (renameResult.isError()) {
+    // Exit the agent since the checkpoint could not be committed.
+    EXIT(EXIT_FAILURE)
+      << "Failed to move target resources " << resourceState.resources()
+      << " and operations " << resourceState.operations()
+      << ": " << renameResult.error();
   }
 
   if (operationsToCheckpoint != checkpointedOperations) {
@@ -5523,6 +5705,16 @@ void Slave::reregisterExecutorTimeout()
     }
   }
 
+  // Replay any active draining.
+  if (drainConfig.isSome()) {
+    DrainSlaveMessage drainSlaveMessage;
+    *drainSlaveMessage.mutable_config() = *drainConfig;
+
+    LOG(INFO) << "Replaying in-process agent draining";
+
+    drain(self(), std::move(drainSlaveMessage));
+  }
+
   // Signal the end of recovery.
   // TODO(greggomann): Allow the agent to complete recovery before the executor
   // re-registration timeout has elapsed. See MESOS-7539
@@ -5617,6 +5809,41 @@ void Slave::statusUpdate(StatusUpdate update, const Option<UPID>& pid)
     return;
   }
 
+  // If the agent is draining we provide additional
+  // information for KILLING or KILLED states.
+  if (drainConfig.isSome()) {
+    switch (update.status().state()) {
+      case TASK_STAGING:
+      case TASK_STARTING:
+      case TASK_RUNNING:
+      case TASK_FAILED:
+      case TASK_FINISHED:
+      case TASK_ERROR:
+      case TASK_LOST:
+      case TASK_DROPPED:
+      case TASK_UNREACHABLE:
+      case TASK_GONE:
+      case TASK_GONE_BY_OPERATOR:
+      case TASK_UNKNOWN: {
+        break;
+      }
+      case TASK_KILLING:
+      case TASK_KILLED: {
+        // We unconditionally overwrite any previous reason to provide a
+        // consistent signal that this task went away during draining.
+        update.mutable_status()->set_reason(TaskStatus::REASON_SLAVE_DRAINING);
+
+        // If the draining marks the agent as gone report tasks as
+        // gone by operator.
+        if (drainConfig->mark_gone() &&
+            framework->capabilities.partitionAware) {
+          update.mutable_status()->set_state(TASK_GONE_BY_OPERATOR);
+        }
+        break;
+      }
+    }
+  }
+
   if (HookManager::hooksAvailable()) {
     // Even though the hook(s) return a TaskStatus, we only use two fields:
     // container_status and labels. Remaining fields are discarded.
@@ -5653,6 +5880,8 @@ void Slave::statusUpdate(StatusUpdate update, const Option<UPID>& pid)
 
     taskStatusUpdateManager->update(update, info.id())
       .onAny(defer(self(), &Slave::___statusUpdate, lambda::_1, update, pid));
+
+    return;
   }
 
   Executor* executor = framework->getExecutor(status.task_id());
@@ -5718,6 +5947,8 @@ void Slave::statusUpdate(StatusUpdate update, const Option<UPID>& pid)
   }
 
   metrics.valid_status_updates++;
+
+  executor->addPendingTaskStatus(status);
 
   // Before sending update, we need to retrieve the container status
   // if the task reached the executor. For tasks that are queued, we
@@ -5930,6 +6161,17 @@ void Slave::___statusUpdate(
   VLOG(1) << "Task status update manager successfully handled status update "
           << update;
 
+  const TaskStatus& status = update.status();
+
+  Executor* executor = nullptr;
+  Framework* framework = getFramework(update.framework_id());
+  if (framework != nullptr) {
+    executor = framework->getExecutor(status.task_id());
+    if (executor != nullptr) {
+      executor->removePendingTaskStatus(status);
+    }
+  }
+
   if (pid == UPID()) {
     return;
   }
@@ -5937,7 +6179,7 @@ void Slave::___statusUpdate(
   StatusUpdateAcknowledgementMessage message;
   message.mutable_framework_id()->MergeFrom(update.framework_id());
   message.mutable_slave_id()->MergeFrom(update.slave_id());
-  message.mutable_task_id()->MergeFrom(update.status().task_id());
+  message.mutable_task_id()->MergeFrom(status.task_id());
   message.set_uuid(update.uuid());
 
   // Task status update manager successfully handled the status update.
@@ -5949,14 +6191,12 @@ void Slave::___statusUpdate(
     send(pid.get(), message);
   } else {
     // Acknowledge the HTTP based executor.
-    Framework* framework = getFramework(update.framework_id());
     if (framework == nullptr) {
       LOG(WARNING) << "Ignoring sending acknowledgement for status update "
                    << update << " of unknown framework";
       return;
     }
 
-    Executor* executor = framework->getExecutor(update.status().task_id());
     if (executor == nullptr) {
       // Refer to the comments in 'statusUpdate()' on when this can
       // happen.
@@ -6300,7 +6540,11 @@ ExecutorInfo Slave::getExecutorInfo(
     if (!task.command().has_value()) {
       name += "(Command: NO COMMAND)";
     } else {
+#ifdef __WINDOWS__
+      name += "(Command: cmd /c '";
+#else
       name += "(Command: sh -c '";
+#endif // __WINDOWS__
       if (task.command().value().length() > 15) {
         name += task.command().value().substr(0, 12) + "...')";
       } else {
@@ -6670,6 +6914,19 @@ void Slave::executorTerminated(
           sendExecutorTerminatedStatusUpdate(
               taskId, termination, frameworkId, executor);
         }
+      } else {
+        // When the framework is TERMINATING, we cannot send status updates
+        // for "launched tasks", but these tasks no longer belong in the
+        // `launchedTasks` structure. These tasks will continue to show
+        // in the agent's state (as a completed executor) for some time
+        // after the framework/executor terminates.
+        foreachpair (
+            const TaskID& taskId,
+            Task* task,
+            utils::copy(executor->launchedTasks)) {
+          executor->launchedTasks.erase(taskId);
+          executor->terminatedTasks[taskId] = task;
+        }
       }
 
       // Only send ExitedExecutorMessage if it is not a Command (or
@@ -6872,6 +7129,8 @@ void Slave::removeFramework(Framework* framework)
 
   // Pass ownership of the framework pointer.
   completedFrameworks.set(framework->id(), Owned<Framework>(framework));
+
+  updateDrainStatus();
 
   if (state == TERMINATING && frameworks.empty()) {
     terminate(self());
@@ -7340,14 +7599,31 @@ Future<Nothing> Slave::recover(const Try<state::State>& state)
             syncResult.error());
       }
 
-      // Rename the target checkpoint to the committed checkpoint.
+      // At this point, `syncCheckpointedResources()` has ensured that any
+      // change in checkpointed resources (e.g. persistent volumes) is now
+      // reflected on disk. We rename the target resource state file to the
+      // actual resource state file, which is our source of truth for the
+      // current state of the agent resources.
       Try<Nothing> renameResult = os::rename(
+          paths::getResourceStateTargetPath(metaDir),
+          paths::getResourceStatePath(metaDir));
+
+      if (renameResult.isError()) {
+        return Failure(
+            "Failed to rename target resources " +
+            stringify(targetResources) + " and associated operations: " +
+            renameResult.error());
+      }
+
+      // The following rename call handles the pre-operation-feedback
+      // checkpoint format for backward compatibility.
+      renameResult = os::rename(
           paths::getResourcesTargetPath(metaDir),
           paths::getResourcesInfoPath(metaDir));
 
       if (renameResult.isError()) {
         return Failure(
-            "Failed to checkpoint resources " +
+            "Failed to rename target resources " +
             stringify(targetResources) + ": " +
             renameResult.error());
       }
@@ -7391,6 +7667,8 @@ Future<Nothing> Slave::recover(const Try<state::State>& state)
     // both of them for equality. This is safe because if it turned out that
     // we can not reuse the id, we will either crash or erase it again.
     info.mutable_id()->CopyFrom(slaveState->info->id());
+
+    drainConfig = slaveState->drainConfig;
 
     // Check for SlaveInfo compatibility.
     Try<Nothing> _compatible =
@@ -7640,8 +7918,9 @@ Future<Nothing> Slave::__recoverOperations(
     if (operation->latest_status().state() == OPERATION_PENDING) {
       // The agent failed over before the checkpoint of the
       // `OPERATION_FINISHED` update completed.
-      CHECK(state->streams.get(operationUuid).isNone() ||
-            state->streams.get(operationUuid)->isNone());
+      CHECK(
+          !state->streams.contains(operationUuid) ||
+          state->streams.at(operationUuid).isNone());
 
       Option<OperationID> operationId =
         operation->info().has_id()
@@ -8748,6 +9027,8 @@ void Slave::removeOperation(Operation* operation)
 
   checkpointResourceState(
       totalResources.filter(mesos::needCheckpointing), false);
+
+  updateDrainStatus();
 }
 
 
@@ -9211,13 +9492,13 @@ Future<bool> Slave::authorizeSandboxAccess(
           ObjectApprover::Object object;
 
           if (frameworks.contains(frameworkId)) {
-            Framework* framework = frameworks.get(frameworkId).get();
+            Framework* framework = frameworks.at(frameworkId);
 
             object.framework_info = &(framework->info);
 
             if (framework->executors.contains(executorId)) {
               object.executor_info =
-                &(framework->executors.get(executorId).get()->info);
+                &(framework->executors.at(executorId)->info);
             }
           }
 
@@ -9569,6 +9850,34 @@ void Slave::initializeResourceProviderManager(
     resourceProviderManager->messages().get().onAny(
         defer(self(), &Self::handleResourceProviderMessage, lambda::_1));
   }
+}
+
+
+void Slave::updateDrainStatus()
+{
+  if (drainConfig.isNone()) {
+    return;
+  }
+
+  bool drained = operations.empty() && frameworks.empty();
+
+  if (!drained) {
+    return;
+  }
+
+  LOG(INFO) << "Agent finished draining";
+
+  const string drainConfigPath = paths::getDrainConfigPath(metaDir, info.id());
+
+  Try<Nothing> rm = os::rm(drainConfigPath);
+
+  if (rm.isError()) {
+    EXIT(EXIT_FAILURE) << "Could not remove persisted drain configuration "
+                       << "'" << drainConfigPath << "': " << rm.error();
+  }
+
+  drainConfig = None();
+  estimatedDrainStartTime = None();
 }
 
 
@@ -10023,6 +10332,18 @@ void Framework::recoverExecutor(
           executor->info,
           executor->containerId,
           defaultExecutorTasks));
+
+    // Make sure there are no "launched tasks" on a recovered completed
+    // executor. We can only encounter these non-terminal terminated tasks
+    // when recovering a checkpointed executor that is missing a terminal
+    // status update. See MESOS-9750 for a one way to enter this state.
+    foreachpair (
+        const TaskID& taskId,
+        Task* task,
+        utils::copy(executor->launchedTasks)) {
+      executor->launchedTasks.erase(taskId);
+      executor->terminatedTasks[taskId] = task;
+    }
 
     // GC the executor run's meta directory.
     slave->garbageCollect(paths::getExecutorRunPath(
@@ -10487,6 +10808,33 @@ void Executor::recoverTask(const TaskState& state, bool recheckpointTask)
 }
 
 
+void Executor::addPendingTaskStatus(const TaskStatus& status)
+{
+  auto uuid = id::UUID::fromBytes(status.uuid()).get();
+  pendingStatusUpdates[status.task_id()][uuid] = status;
+}
+
+
+void Executor::removePendingTaskStatus(const TaskStatus& status)
+{
+  const TaskID& taskId = status.task_id();
+
+  auto uuid = id::UUID::fromBytes(status.uuid()).get();
+
+  if (!pendingStatusUpdates.contains(taskId) ||
+      !pendingStatusUpdates[taskId].contains(uuid)) {
+    LOG(WARNING) << "Unknown pending status update (uuid: " << uuid << ")";
+    return;
+  }
+
+  pendingStatusUpdates[taskId].erase(uuid);
+
+  if (pendingStatusUpdates[taskId].empty()) {
+    pendingStatusUpdates.erase(taskId);
+  }
+}
+
+
 Try<Nothing> Executor::updateTaskState(const TaskStatus& status)
 {
   bool terminal = protobuf::isTerminalState(status.state());
@@ -10510,6 +10858,24 @@ Try<Nothing> Executor::updateTaskState(const TaskStatus& status)
     task = launchedTasks.at(status.task_id());
 
     if (terminal) {
+      if (pendingStatusUpdates.contains(status.task_id())) {
+        auto statusUpdates = pendingStatusUpdates[status.task_id()].values();
+
+        auto firstTerminal = std::find_if(
+            statusUpdates.begin(),
+            statusUpdates.end(),
+            [](const TaskStatus& status) {
+              return protobuf::isTerminalState(status.state());
+            });
+
+        CHECK(firstTerminal != statusUpdates.end());
+
+        if (firstTerminal->uuid() != status.uuid()) {
+          return Error("Unexpected terminal status update after first status"
+                       " update " + stringify(firstTerminal->state()));
+        }
+      }
+
       launchedTasks.erase(taskId);
     }
   } else if (terminatedTasks.contains(taskId)) {

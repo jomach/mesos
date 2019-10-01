@@ -66,6 +66,7 @@ using google::protobuf::RepeatedPtrField;
 
 using mesos::authorization::VIEW_ROLE;
 
+using mesos::slave::ContainerFileOperation;
 using mesos::slave::ContainerLimitation;
 using mesos::slave::ContainerMountInfo;
 using mesos::slave::ContainerState;
@@ -413,6 +414,10 @@ Task createTask(
 
   if (task.has_health_check()) {
     t.mutable_health_check()->CopyFrom(task.health_check());
+  }
+
+  if (task.has_kill_policy()) {
+    t.mutable_kill_policy()->CopyFrom(task.kill_policy());
   }
 
   // Copy `user` if set.
@@ -1134,7 +1139,8 @@ bool operator==(const Capabilities& left, const Capabilities& right)
          left.reservationRefinement == right.reservationRefinement &&
          left.resourceProvider == right.resourceProvider &&
          left.resizeVolume == right.resizeVolume &&
-         left.agentOperationFeedback == right.agentOperationFeedback;
+         left.agentOperationFeedback == right.agentOperationFeedback &&
+         left.agentDraining == right.agentDraining;
 }
 
 
@@ -1173,6 +1179,7 @@ ContainerLimitation createContainerLimitation(
 
 ContainerState createContainerState(
     const Option<ExecutorInfo>& executorInfo,
+    const Option<ContainerInfo>& containerInfo,
     const ContainerID& containerId,
     pid_t pid,
     const string& directory)
@@ -1181,6 +1188,10 @@ ContainerState createContainerState(
 
   if (executorInfo.isSome()) {
     state.mutable_executor_info()->CopyFrom(executorInfo.get());
+  }
+
+  if (containerInfo.isSome()) {
+    state.mutable_container_info()->CopyFrom(containerInfo.get());
   }
 
   state.mutable_container_id()->CopyFrom(containerId);
@@ -1239,6 +1250,60 @@ ContainerMountInfo createContainerMount(
   mnt.set_flags(flags);
 
   return mnt;
+}
+
+
+mesos::slave::ContainerFileOperation containerSymlinkOperation(
+    const std::string& source,
+    const std::string& target)
+{
+  ContainerFileOperation op;
+
+  op.set_operation(ContainerFileOperation::SYMLINK);
+  op.mutable_symlink()->set_source(source);
+  op.mutable_symlink()->set_target(target);
+
+  return op;
+}
+
+
+mesos::slave::ContainerFileOperation containerRenameOperation(
+    const std::string& source,
+    const std::string& target)
+{
+  ContainerFileOperation op;
+
+  op.set_operation(ContainerFileOperation::RENAME);
+  op.mutable_rename()->set_source(source);
+  op.mutable_rename()->set_target(target);
+
+  return op;
+}
+
+
+mesos::slave::ContainerFileOperation containerMkdirOperation(
+    const std::string& target,
+    const bool recursive)
+{
+  ContainerFileOperation op;
+
+  op.set_operation(ContainerFileOperation::MKDIR);
+  op.mutable_mkdir()->set_target(target);
+  op.mutable_mkdir()->set_recursive(recursive);
+
+  return op;
+}
+
+
+mesos::slave::ContainerFileOperation containerMountOperation(
+    const ContainerMountInfo& mnt)
+{
+  ContainerFileOperation op;
+
+  op.set_operation(ContainerFileOperation::MOUNT);
+  *op.mutable_mount() = mnt;
+
+  return op;
 }
 
 } // namespace slave {
@@ -1303,6 +1368,47 @@ mesos::maintenance::Schedule createSchedule(
 } // namespace maintenance {
 
 namespace master {
+
+void addMinimumCapability(
+    google::protobuf::RepeatedPtrField<Registry::MinimumCapability>*
+      capabilities,
+    const MasterInfo::Capability::Type& capability)
+{
+  int capabilityIndex =
+    find_if(
+        capabilities->begin(),
+        capabilities->end(),
+        [&](const Registry::MinimumCapability& mc) {
+          return mc.capability() == MasterInfo_Capability_Type_Name(capability);
+        }) -
+    capabilities->begin();
+
+  if (capabilityIndex == capabilities->size()) {
+    capabilities->Add()->set_capability(
+        MasterInfo_Capability_Type_Name(capability));
+  }
+}
+
+
+void removeMinimumCapability(
+    google::protobuf::RepeatedPtrField<Registry::MinimumCapability>*
+      capabilities,
+    const MasterInfo::Capability::Type& capability)
+{
+  int capabilityIndex =
+    find_if(
+        capabilities->begin(),
+        capabilities->end(),
+        [&](const Registry::MinimumCapability& mc) {
+          return mc.capability() == MasterInfo_Capability_Type_Name(capability);
+        }) -
+    capabilities->begin();
+
+  if (capabilityIndex < capabilities->size()) {
+    capabilities->DeleteSubrange(capabilityIndex, 1);
+  }
+}
+
 namespace event {
 
 mesos::master::Event createTaskUpdated(
@@ -1337,10 +1443,6 @@ mesos::master::Event createTaskAdded(const Task& task)
 mesos::master::Event createFrameworkAdded(
     const mesos::internal::master::Framework& _framework)
 {
-  CHECK(_framework.active());
-  CHECK(_framework.connected());
-  CHECK(!_framework.recovered());
-
   mesos::master::Event event;
   event.set_type(mesos::master::Event::FRAMEWORK_ADDED);
 
@@ -1406,6 +1508,8 @@ mesos::master::Event createFrameworkRemoved(const FrameworkInfo& frameworkInfo)
 
 mesos::master::Response::GetAgents::Agent createAgentResponse(
     const mesos::internal::master::Slave& slave,
+    const Option<DrainInfo>& drainInfo,
+    bool deactivated,
     const Option<Owned<ObjectApprovers>>& approvers)
 {
   mesos::master::Response::GetAgents::Agent agent;
@@ -1414,6 +1518,7 @@ mesos::master::Response::GetAgents::Agent createAgentResponse(
 
   agent.set_pid(string(slave.pid));
   agent.set_active(slave.active);
+  agent.set_deactivated(deactivated);
   agent.set_version(slave.version);
 
   agent.mutable_registered_time()->set_nanoseconds(
@@ -1466,18 +1571,32 @@ mesos::master::Response::GetAgents::Agent createAgentResponse(
         resourceProvider.totalResources);
   }
 
+  if (drainInfo.isSome()) {
+    agent.mutable_drain_info()->CopyFrom(drainInfo.get());
+
+    if (slave.estimatedDrainStartTime.isSome()) {
+      agent.mutable_estimated_drain_start_time()->set_nanoseconds(
+          Seconds(slave.estimatedDrainStartTime->secs()).ns());
+    }
+  }
+
   return agent;
 }
 
 
 mesos::master::Event createAgentAdded(
-    const mesos::internal::master::Slave& slave)
+    const mesos::internal::master::Slave& slave,
+    const Option<DrainInfo>& drainInfo,
+    bool deactivated)
 {
   mesos::master::Event event;
   event.set_type(mesos::master::Event::AGENT_ADDED);
 
   event.mutable_agent_added()->mutable_agent()->CopyFrom(
-      createAgentResponse(slave));
+      createAgentResponse(
+          slave,
+          drainInfo,
+          deactivated));
 
   return event;
 }

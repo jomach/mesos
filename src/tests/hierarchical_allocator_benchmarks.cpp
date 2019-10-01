@@ -32,8 +32,6 @@
 #include <stout/hashmap.hpp>
 #include <stout/stopwatch.hpp>
 
-#include "common/resource_quantities.hpp"
-
 #include "master/constants.hpp"
 
 #include "master/allocator/mesos/hierarchical.hpp"
@@ -45,8 +43,6 @@ using mesos::internal::master::MIN_CPUS;
 using mesos::internal::master::MIN_MEM;
 
 using mesos::internal::master::allocator::HierarchicalDRFAllocator;
-
-using mesos::internal::ResourceQuantities;
 
 using mesos::internal::slave::AGENT_CAPABILITIES;
 
@@ -613,11 +609,11 @@ TEST_P(BENCHMARK_HierarchicalAllocator_WithQuotaParam, LargeAndSmallQuota)
   allocator->pause();
 
   foreach (const string& role, smallQuotaRoles) {
-    allocator->setQuota(role, createQuota(role, smallQuotaResourcesString));
+    allocator->updateQuota(role, createQuota(smallQuotaResourcesString));
   }
 
   foreach (const string& role, largeQuotaRoles) {
-    allocator->setQuota(role, createQuota(role, largeQuotaResourcesString));
+    allocator->updateQuota(role, createQuota(largeQuotaResourcesString));
   }
 
   allocator->resume();
@@ -766,7 +762,7 @@ TEST_P(
     allocator->pause();
 
     foreach (const string& role, roles) {
-      allocator->setQuota(role, createQuota(role, quotaResourcesString));
+      allocator->updateQuota(role, createQuota(quotaResourcesString));
     }
 
     allocator->resume();

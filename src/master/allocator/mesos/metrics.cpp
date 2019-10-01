@@ -111,13 +111,19 @@ Metrics::~Metrics()
   }
 
   foreachkey (const string& role, quota_allocated) {
-    foreachvalue (const PullGauge& gauge, quota_allocated[role]) {
+    foreachvalue (const PullGauge& gauge, quota_allocated.at(role)) {
       process::metrics::remove(gauge);
     }
   }
 
   foreachkey (const string& role, quota_guarantee) {
-    foreachvalue (const PullGauge& gauge, quota_guarantee[role]) {
+    foreachvalue (const PushGauge& gauge, quota_guarantee.at(role)) {
+      process::metrics::remove(gauge);
+    }
+  }
+
+  foreachkey (const string& role, quota_limit) {
+    foreachvalue (const PushGauge& gauge, quota_limit.at(role)) {
       process::metrics::remove(gauge);
     }
   }
@@ -128,61 +134,89 @@ Metrics::~Metrics()
 }
 
 
-void Metrics::setQuota(const string& role, const Quota& quota)
+void Metrics::updateQuota(const string& role, const Quota& quota)
 {
-  CHECK(!quota_allocated.contains(role));
-
-  hashmap<string, PullGauge> allocated;
-  hashmap<string, PullGauge> guarantees;
-
-  foreach (const Resource& resource, quota.info.guarantee()) {
-    CHECK_EQ(Value::SCALAR, resource.type());
-    double value = resource.scalar().value();
-
-    PullGauge guarantee = PullGauge(
-        "allocator/mesos/quota"
-        "/roles/" + role +
-        "/resources/" + resource.name() +
-        "/guarantee",
-        process::defer([value]() { return value; }));
-
-    PullGauge offered_or_allocated(
-        "allocator/mesos/quota"
-        "/roles/" + role +
-        "/resources/" + resource.name() +
-        "/offered_or_allocated",
-        defer(allocator,
-              &HierarchicalAllocatorProcess::_quota_allocated,
-              role,
-              resource.name()));
-
-    guarantees.put(resource.name(), guarantee);
-    allocated.put(resource.name(), offered_or_allocated);
-
-    process::metrics::add(guarantee);
-    process::metrics::add(offered_or_allocated);
-  }
-
-  quota_allocated[role] = allocated;
-  quota_guarantee[role] = guarantees;
-}
-
-
-void Metrics::removeQuota(const string& role)
-{
-  CHECK(quota_allocated.contains(role));
-  CHECK(quota_guarantee.contains(role));
-
+  // First remove the existing metrics.
   foreachvalue (const PullGauge& gauge, quota_allocated[role]) {
     process::metrics::remove(gauge);
   }
+  quota_allocated.erase(role);
 
-  foreachvalue (const PullGauge& gauge, quota_guarantee[role]) {
+  foreachvalue (const PushGauge& gauge, quota_guarantee[role]) {
     process::metrics::remove(gauge);
   }
-
-  quota_allocated.erase(role);
   quota_guarantee.erase(role);
+
+  foreachvalue (const PushGauge& gauge, quota_limit[role]) {
+    process::metrics::remove(gauge);
+  }
+  quota_limit.erase(role);
+
+  // This is the original quota "remove" case where the
+  // role's quota is set to the default. We used to not
+  // show the quota allocated_or_offered metric in this
+  // case, so we keep this behavior for now.
+  //
+  // TODO(mzhu): always expose the allocated gauge even
+  // if a role only has default quota.
+  if (quota == DEFAULT_QUOTA) {
+    return;
+  }
+
+  // Now add the new metrics.
+
+  foreach (auto& quantity, quota.guarantees) {
+    PushGauge guarantee(
+        "allocator/mesos/quota"
+        "/roles/" + role +
+        "/resources/" + quantity.first +
+        "/guarantee");
+
+    guarantee = quantity.second.value();
+
+    process::metrics::add(guarantee);
+
+    quota_guarantee[role].put(quantity.first, guarantee);
+  }
+
+  foreach (auto& quantity, quota.limits) {
+    PushGauge limit(
+        "allocator/mesos/quota"
+        "/roles/" + role +
+        "/resources/" + quantity.first +
+        "/limit");
+
+    limit = quantity.second.value();
+
+    process::metrics::add(limit);
+
+    quota_limit[role].put(quantity.first, limit);
+  }
+
+  hashset<string> names;
+
+  foreach (auto& quantity, quota.guarantees) {
+    names.insert(quantity.first);
+  }
+  foreach (auto& quantity, quota.limits) {
+    names.insert(quantity.first);
+  }
+
+  foreach (const string& name, names) {
+    PullGauge offered_or_allocated(
+        "allocator/mesos/quota"
+        "/roles/" + role +
+        "/resources/" + name +
+        "/offered_or_allocated",
+        defer(allocator,
+              &HierarchicalAllocatorProcess::_quota_offered_or_allocated,
+              role,
+              name));
+
+    process::metrics::add(offered_or_allocated);
+
+    quota_allocated[role].put(name, offered_or_allocated);
+  }
 }
 
 

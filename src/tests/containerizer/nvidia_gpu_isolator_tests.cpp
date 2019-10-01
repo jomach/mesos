@@ -32,6 +32,8 @@
 #include <stout/jsonify.hpp>
 #include <stout/os/exists.hpp>
 
+#include "common/protobuf_utils.hpp"
+
 #include "docker/docker.hpp"
 
 #include "master/master.hpp"
@@ -73,6 +75,7 @@ using testing::AtMost;
 using testing::DoAll;
 using testing::Eq;
 using testing::Return;
+using testing::Truly;
 
 namespace mesos {
 namespace internal {
@@ -306,16 +309,20 @@ TEST_F(NvidiaGpuTest, ROOT_INTERNET_CURL_CGROUPS_NVIDIA_GPU_NvidiaDockerImage)
 
   Future<v1::scheduler::Event::Update> task1Finished;
   EXPECT_CALL(*scheduler, update(_, AllOf(
-      TaskStatusUpdateTaskIdEq(task1),
-      TaskStatusUpdateIsTerminalState())))
+      TaskStatusUpdateTaskIdEq(task1.task_id()),
+      Truly([](const v1::scheduler::Event::Update& update) {
+        return protobuf::isTerminalState(devolve(update.status()).state());
+      }))))
     .WillOnce(DoAll(
         FutureArg<1>(&task1Finished),
         v1::scheduler::SendAcknowledge(frameworkId, agentId)));
 
   Future<v1::scheduler::Event::Update> task2Failed;
   EXPECT_CALL(*scheduler, update(_, AllOf(
-      TaskStatusUpdateTaskIdEq(task2),
-      TaskStatusUpdateIsTerminalState())))
+      TaskStatusUpdateTaskIdEq(task2.task_id()),
+      Truly([](const v1::scheduler::Event::Update& update) {
+        return protobuf::isTerminalState(devolve(update.status()).state());
+      }))))
     .WillOnce(DoAll(
         FutureArg<1>(&task2Failed),
         v1::scheduler::SendAcknowledge(frameworkId, agentId)));
@@ -429,7 +436,11 @@ TEST_F(NvidiaGpuTest, ROOT_INTERNET_CURL_CGROUPS_NVIDIA_GPU_TensorflowGpuImage)
     .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, agentId));
 
   Future<v1::scheduler::Event::Update> terminalStatusUpdate;
-  EXPECT_CALL(*scheduler, update(_, TaskStatusUpdateIsTerminalState()))
+  EXPECT_CALL(*scheduler, update(
+      _,
+      Truly([](const v1::scheduler::Event::Update& update) {
+        return protobuf::isTerminalState(devolve(update.status()).state());
+      })))
     .WillOnce(DoAll(
         FutureArg<1>(&terminalStatusUpdate),
         v1::scheduler::SendAcknowledge(frameworkId, agentId)));

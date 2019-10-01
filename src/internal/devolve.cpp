@@ -68,6 +68,30 @@ Credential devolve(const v1::Credential& credential)
 }
 
 
+DrainConfig devolve(const v1::DrainConfig& drainConfig)
+{
+  return devolve<DrainConfig>(drainConfig);
+}
+
+
+DrainInfo devolve(const v1::DrainInfo& drainInfo)
+{
+  return devolve<DrainInfo>(drainInfo);
+}
+
+
+DurationInfo devolve(const google::protobuf::Duration& duration)
+{
+  DurationInfo durationInfo;
+
+  // NOTE: If not specified, the fields of Duration default to zero.
+  durationInfo.set_nanoseconds(
+      duration.seconds() * 1000000000 + duration.nanos());
+
+  return durationInfo;
+}
+
+
 ExecutorID devolve(const v1::ExecutorID& executorId)
 {
   return devolve<ExecutorID>(executorId);
@@ -101,6 +125,12 @@ InverseOffer devolve(const v1::InverseOffer& inverseOffer)
 Offer devolve(const v1::Offer& offer)
 {
   return devolve<Offer>(offer);
+}
+
+
+Offer::Operation devolve(const v1::Offer::Operation& operation)
+{
+  return devolve<Offer::Operation>(operation);
 }
 
 
@@ -250,7 +280,19 @@ mesos::agent::Response devolve(const v1::agent::Response& response)
 
 mesos::master::Call devolve(const v1::master::Call& call)
 {
-  return devolve<mesos::master::Call>(call);
+  mesos::master::Call _call = devolve<mesos::master::Call>(call);
+
+  // The `google.protobuf.Duration` field in the `DrainAgent` call does not get
+  // devolved automatically with the templated helper, so we devolve it
+  // explicitly here.
+  if (call.type() == v1::master::Call::DRAIN_AGENT &&
+      call.has_drain_agent() &&
+      call.drain_agent().has_max_grace_period()) {
+    *_call.mutable_drain_agent()->mutable_max_grace_period() =
+      devolve(call.drain_agent().max_grace_period());
+  }
+
+  return _call;
 }
 
 } // namespace internal {

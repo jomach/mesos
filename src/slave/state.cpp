@@ -85,7 +85,7 @@ Try<State> recover(const string& rootDir, bool strict)
   // resources checkpoint file.
   state.resources = resources.get();
 
-  const string& bootIdPath = paths::getBootIdPath(rootDir);
+  const string bootIdPath = paths::getBootIdPath(rootDir);
   if (os::exists(bootIdPath)) {
     Result<string> read = state::read<string>(bootIdPath);
     if (read.isError()) {
@@ -102,7 +102,7 @@ Try<State> recover(const string& rootDir, bool strict)
     }
   }
 
-  const string& latest = paths::getLatestSlavePath(rootDir);
+  const string latest = paths::getLatestSlavePath(rootDir);
 
   // Check if the "latest" symlink to a slave directory exists.
   if (!os::exists(latest)) {
@@ -147,7 +147,7 @@ Try<SlaveState> SlaveState::recover(
   state.id = slaveId;
 
   // Read the slave info.
-  const string& path = paths::getSlaveInfoPath(rootDir, slaveId);
+  const string path = paths::getSlaveInfoPath(rootDir, slaveId);
   if (!os::exists(path)) {
     // This could happen if the slave died before it registered with
     // the master.
@@ -158,7 +158,7 @@ Try<SlaveState> SlaveState::recover(
   Result<SlaveInfo> slaveInfo = state::read<SlaveInfo>(path);
 
   if (slaveInfo.isError()) {
-    const string& message = "Failed to read agent info from '" + path + "': " +
+    const string message = "Failed to read agent info from '" + path + "': " +
                             slaveInfo.error();
     if (strict) {
       return Error(message);
@@ -203,8 +203,55 @@ Try<SlaveState> SlaveState::recover(
     state.errors += framework->errors;
   }
 
-  const string& resourceStatePath = paths::getResourceStatePath(rootDir);
-  if (os::exists(resourceStatePath)) {
+  // Recover any drain state.
+  const string drainConfigPath = paths::getDrainConfigPath(rootDir, slaveId);
+  if (os::exists(drainConfigPath)) {
+    Result<DrainConfig> drainConfig = state::read<DrainConfig>(drainConfigPath);
+    if (drainConfig.isError()) {
+      string message = "Failed to read agent state file '"
+                       + drainConfigPath + "': " + drainConfig.error();
+
+      LOG(WARNING) << message;
+      state.errors++;
+    }
+    if (drainConfig.isSome()) {
+      state.drainConfig = *drainConfig;
+    }
+  }
+
+  // Operations might be checkpointed in either the target resource state file
+  // or in the final resource state checkpoint location. If the target file
+  // exists, then the agent must have crashed while attempting to sync those
+  // target resources to disk. Since agent recovery guarantees that the agent
+  // will not successfully recover until the target resources are synced to disk
+  // and moved to the final checkpoint location, here we can safely recover
+  // operations from the target file if it exists.
+
+  const string targetPath = paths::getResourceStateTargetPath(rootDir);
+  const string resourceStatePath = paths::getResourceStatePath(rootDir);
+
+  if (os::exists(targetPath)) {
+    Result<ResourceState> target = state::read<ResourceState>(targetPath);
+    if (target.isError()) {
+      string message = "Failed to read resources and operations target file '" +
+                       targetPath + "': " + target.error();
+
+      if (strict) {
+        return Error(message);
+      } else {
+        LOG(WARNING) << message;
+        state.errors++;
+        return state;
+      }
+    }
+
+    if (target.isSome()) {
+      state.operations = std::vector<Operation>();
+      foreach (const Operation& operation, target->operations()) {
+        state.operations->push_back(operation);
+      }
+    }
+  } else if (os::exists(resourceStatePath)) {
     Result<ResourceState> resourceState =
       state::read<ResourceState>(resourceStatePath);
     if (resourceState.isError()) {
@@ -368,7 +415,7 @@ Try<ExecutorState> ExecutorState::recover(
   // Recover the runs.
   foreach (const string& path, runs.get()) {
     if (Path(path).basename() == paths::LATEST_SYMLINK) {
-      const Result<string>& latest = os::realpath(path);
+      const Result<string> latest = os::realpath(path);
       if (!latest.isSome()) {
         return Error(
             "Failed to find latest run of executor '" +
@@ -417,7 +464,7 @@ Try<ExecutorState> ExecutorState::recover(
   }
 
   // Read the executor info.
-  const string& path =
+  const string path =
     paths::getExecutorInfoPath(rootDir, slaveId, frameworkId, executorId);
   if (!os::exists(path)) {
     // This could happen if the slave died after creating the executor
@@ -762,8 +809,20 @@ Try<ResourcesState> ResourcesState::recover(
 {
   ResourcesState state;
 
-  const string& resourceStatePath = paths::getResourceStatePath(rootDir);
+  // The checkpointed resources may exist in one of two different formats:
+  // 1) Pre-operation-feedback, where only resources are written to a target
+  //    file, then moved to the final checkpoint location once any persistent
+  //    volumes have been committed to disk.
+  // 2) Post-operation-feedback, where both resources and operations are written
+  //    to a target file, then moved to the final checkpoint location once any
+  //    persistent volumes have been committed to disk.
+  //
+  // The post-operation-feedback agent writes both of these formats to disk to
+  // enable agent downgrades.
+
+  const string resourceStatePath = paths::getResourceStatePath(rootDir);
   if (os::exists(resourceStatePath)) {
+    // The post-operation-feedback format was detected.
     Result<ResourceState> resourceState =
       state::read<ResourceState>(resourceStatePath);
     if (resourceState.isError()) {
@@ -783,14 +842,40 @@ Try<ResourcesState> ResourcesState::recover(
       state.resources = resourceState->resources();
     }
 
+    const string targetPath = paths::getResourceStateTargetPath(rootDir);
+    if (!os::exists(targetPath)) {
+      return state;
+    }
+
+    Result<ResourceState> target = state::read<ResourceState>(targetPath);
+    if (target.isError()) {
+      string message =
+        "Failed to read resources and operations target file '" +
+        targetPath + "': " + target.error();
+
+      if (strict) {
+        return Error(message);
+      } else {
+        LOG(WARNING) << message;
+        state.errors++;
+        return state;
+      }
+    }
+
+    if (target.isSome()) {
+      state.target = target->resources();
+    }
+
     return state;
   }
+
+  // Falling back to the pre-operation-feedback format.
 
   LOG(INFO) << "No committed checkpointed resources and operations found at '"
             << resourceStatePath << "'";
 
   // Process the committed resources.
-  const string& infoPath = paths::getResourcesInfoPath(rootDir);
+  const string infoPath = paths::getResourcesInfoPath(rootDir);
   if (!os::exists(infoPath)) {
     LOG(INFO) << "No committed checkpointed resources found at '"
               << infoPath << "'";
@@ -816,7 +901,7 @@ Try<ResourcesState> ResourcesState::recover(
   }
 
   // Process the target resources.
-  const string& targetPath = paths::getResourcesTargetPath(rootDir);
+  const string targetPath = paths::getResourcesTargetPath(rootDir);
   if (!os::exists(targetPath)) {
     return state;
   }

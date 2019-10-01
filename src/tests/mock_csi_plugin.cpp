@@ -16,6 +16,10 @@
 
 #include "tests/mock_csi_plugin.hpp"
 
+#include <algorithm>
+
+#include <stout/bytes.hpp>
+
 using std::string;
 using std::unique_ptr;
 
@@ -59,8 +63,20 @@ MockCSIPlugin::MockCSIPlugin()
   EXPECT_CALL(*this, Probe(_, _, A<csi::v0::ProbeResponse*>()))
     .WillRepeatedly(Return(Status::OK));
 
+  // Return a success by default for testing with the test CSI plugin in
+  // forwarding mode.
   EXPECT_CALL(*this, CreateVolume(_, _, A<csi::v0::CreateVolumeResponse*>()))
-    .WillRepeatedly(Return(Status::OK));
+    .WillRepeatedly(Invoke([](
+        ServerContext* context,
+        const csi::v0::CreateVolumeRequest* request,
+        csi::v0::CreateVolumeResponse* response) {
+      response->mutable_volume()->set_capacity_bytes(std::max(
+          request->capacity_range().required_bytes(),
+          request->capacity_range().limit_bytes()));
+      response->mutable_volume()->set_id(request->name());
+
+      return Status::OK;
+    }));
 
   EXPECT_CALL(*this, DeleteVolume(_, _, A<csi::v0::DeleteVolumeResponse*>()))
     .WillRepeatedly(Return(Status::OK));
@@ -80,8 +96,17 @@ MockCSIPlugin::MockCSIPlugin()
   EXPECT_CALL(*this, ListVolumes(_, _, A<csi::v0::ListVolumesResponse*>()))
     .WillRepeatedly(Return(Status::OK));
 
+  // Return an arbitrary available capacity by default for testing with the test
+  // CSI plugin in forwarding mode.
   EXPECT_CALL(*this, GetCapacity(_, _, A<csi::v0::GetCapacityResponse*>()))
-    .WillRepeatedly(Return(Status::OK));
+    .WillRepeatedly(Invoke([](
+        ServerContext* context,
+        const csi::v0::GetCapacityRequest* request,
+        csi::v0::GetCapacityResponse* response) {
+      response->set_available_capacity(Gigabytes(4).bytes());
+
+      return Status::OK;
+    }));
 
   // Enable all controller RPC capabilities by default for testing with the test
   // CSI plugin in forwarding mode.
@@ -158,8 +183,20 @@ MockCSIPlugin::MockCSIPlugin()
   EXPECT_CALL(*this, Probe(_, _, A<csi::v1::ProbeResponse*>()))
     .WillRepeatedly(Return(Status::OK));
 
+  // Return a success by default for testing with the test CSI plugin in
+  // forwarding mode.
   EXPECT_CALL(*this, CreateVolume(_, _, A<csi::v1::CreateVolumeResponse*>()))
-    .WillRepeatedly(Return(Status::OK));
+    .WillRepeatedly(Invoke([](
+        ServerContext* context,
+        const csi::v1::CreateVolumeRequest* request,
+        csi::v1::CreateVolumeResponse* response) {
+      response->mutable_volume()->set_capacity_bytes(std::max(
+          request->capacity_range().required_bytes(),
+          request->capacity_range().limit_bytes()));
+      response->mutable_volume()->set_volume_id(request->name());
+
+      return Status::OK;
+    }));
 
   EXPECT_CALL(*this, DeleteVolume(_, _, A<csi::v1::DeleteVolumeResponse*>()))
     .WillRepeatedly(Return(Status::OK));
@@ -179,8 +216,17 @@ MockCSIPlugin::MockCSIPlugin()
   EXPECT_CALL(*this, ListVolumes(_, _, A<csi::v1::ListVolumesResponse*>()))
     .WillRepeatedly(Return(Status::OK));
 
+  // Return an arbitrary available capacity by default for testing with the test
+  // CSI plugin in forwarding mode.
   EXPECT_CALL(*this, GetCapacity(_, _, A<csi::v1::GetCapacityResponse*>()))
-    .WillRepeatedly(Return(Status::OK));
+    .WillRepeatedly(Invoke([](
+        ServerContext* context,
+        const csi::v1::GetCapacityRequest* request,
+        csi::v1::GetCapacityResponse* response) {
+      response->set_available_capacity(Gigabytes(4).bytes());
+
+      return Status::OK;
+    }));
 
   // Enable all controller RPC capabilities by default for testing with the test
   // CSI plugin in forwarding mode.

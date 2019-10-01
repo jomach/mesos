@@ -46,6 +46,8 @@
 #include <process/socket.hpp>
 #include <process/state_machine.hpp>
 
+#include <process/ssl/tls_config.hpp>
+
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
 #include <stout/ip.hpp>
@@ -635,28 +637,99 @@ Future<Nothing> Pipe::Writer::readerClosed() const
 
 namespace header {
 
-Try<WWWAuthenticate> WWWAuthenticate::create(const string& value)
+Try<WWWAuthenticate> WWWAuthenticate::create(const string& input)
 {
   // Set `maxTokens` as 2 since auth-param quoted string may
   // contain space (e.g., "Basic realm="Registry Realm").
-  vector<string> tokens = strings::tokenize(value, " ", 2);
+  vector<string> tokens = strings::tokenize(input, " ", 2);
   if (tokens.size() != 2) {
-    return Error("Unexpected WWW-Authenticate header format: '" + value + "'");
+    return Error("Unexpected WWW-Authenticate header format: '" + input + "'");
   }
 
+  // Since the authentication parameters can contain quote values, we
+  // do not use `strings::split` here since the delimiter may occur in
+  // a quoted value which should not be split.
   hashmap<string, string> authParam;
-  foreach (const string& token, strings::split(tokens[1], ",")) {
-    vector<string> split = strings::split(token, "=");
-    if (split.size() != 2) {
-      return Error(
-          "Unexpected auth-param format: '" +
-          token + "' in '" + tokens[1] + "'");
-    }
+  Option<string> key, value;
+  bool inQuotes = false;
 
+  foreach (char c, tokens[1]) {
     // Auth-param values can be a quoted-string or directive values.
     // Please see section "3.2.2.4 Directive values and quoted-string":
     // https://tools.ietf.org/html/rfc2617.
-    authParam[split[0]] = strings::trim(split[1], strings::ANY, "\"");
+    //
+    // If we see a quote we know we must already be parsing `value`
+    // since `key` cannot be a quoted-string.
+    if (c != '"' && inQuotes) {
+      if (value.isNone()) {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+
+      value->append({c});
+      continue;
+    }
+
+    // If we have not yet parsed `key` this character must belong to
+    // it if it is not a space, and cannot be a `,` delimiter.
+    if (key.isNone()) {
+      if (c == ',') {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+
+      if (c == ' ') {
+        continue;
+      }
+
+      key = string({c});
+      continue;
+    }
+
+    // If the current character is `=` we must start parsing a new
+    // `value`. Since we have already handled `=` in quotes above we
+    // cannot already have started parsing `value`.
+    if (c == '=') {
+      if (value.isSome()) {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+      value = "";
+      continue;
+    }
+
+    // If the current character is a quote, drop the
+    // character and toogle the quote state.
+    if (c == '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+
+    // If the current character is a record delimiter and we are not
+    // in quotes, we should have parsed both a key and a value. Store
+    // them, drop the delimiter, and restart parsing.
+    if (c == ',' && !inQuotes) {
+      if (key.isNone() || value.isNone()) {
+        return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+      }
+      authParam[*key] = *value;
+      key = None();
+      value = None();
+
+      continue;
+    }
+
+    // If we have not started parsing `value` we are still parsing `key`.
+    if (value.isNone()) {
+      key->append({c});
+    } else {
+      value->append({c});
+    }
+  }
+
+  // Record the last parsed `(key, value)` pair.
+  if (key.isSome()) {
+    if (value.isNone() || inQuotes) {
+      return Error("Unexpected auth-param format: '" + tokens[1] + "'");
+    }
+    authParam[*key] = *value;
   }
 
   // The realm directive (case-insensitive) is required for all
@@ -1423,7 +1496,10 @@ Future<Nothing> Connection::disconnected()
 }
 
 
-Future<Connection> connect(const network::Address& address, Scheme scheme)
+Future<Connection> connect(
+    const network::Address& address,
+    Scheme scheme,
+    const Option<string>& peer_hostname)
 {
   SocketImpl::Kind kind;
 
@@ -1446,7 +1522,21 @@ Future<Connection> connect(const network::Address& address, Scheme scheme)
     return Failure("Failed to create socket: " + socket.error());
   }
 
-  return socket->connect(address)
+  Future<Nothing> connected = [&]() {
+    switch (scheme) {
+      case Scheme::HTTP:
+        return socket->connect(address);
+#ifdef USE_SSL_SOCKET
+      case Scheme::HTTPS:
+        return socket->connect(
+            address,
+            network::openssl::create_tls_client_config(peer_hostname));
+#endif
+    }
+    UNREACHABLE();
+  }();
+
+  return connected
     .then([socket, address]() -> Future<Connection> {
       Try<network::Address> localAddress = socket->address();
       if (localAddress.isError()) {
@@ -1456,6 +1546,14 @@ Future<Connection> connect(const network::Address& address, Scheme scheme)
 
       return Connection(socket.get(), localAddress.get(), address);
     });
+}
+
+
+Future<Connection> connect(
+    const network::Address& address,
+    Scheme scheme)
+{
+  return connect(address, scheme, None());
 }
 
 
@@ -1489,12 +1587,12 @@ Future<Connection> connect(const URL& url)
 
   // Default to 'http' if no scheme was specified.
   if (url.scheme.isNone() || url.scheme == string("http")) {
-    return connect(address, Scheme::HTTP);
+    return connect(address, Scheme::HTTP, url.domain);
   }
 
   if (url.scheme == string("https")) {
 #ifdef USE_SSL_SOCKET
-    return connect(address, Scheme::HTTPS);
+    return connect(address, Scheme::HTTPS, url.domain);
 #else
     return Failure("'https' scheme requires SSL enabled");
 #endif

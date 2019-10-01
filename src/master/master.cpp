@@ -21,6 +21,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <iterator>
 #include <list>
 #include <memory>
 #include <set>
@@ -29,6 +30,7 @@
 #include <utility>
 
 #include <mesos/module.hpp>
+#include <mesos/resource_quantities.hpp>
 #include <mesos/roles.hpp>
 
 #include <mesos/authentication/authenticator.hpp>
@@ -79,7 +81,6 @@
 #include "common/build.hpp"
 #include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
-#include "common/resource_quantities.hpp"
 #include "common/status_utils.hpp"
 
 #include "credentials/credentials.hpp"
@@ -99,6 +100,7 @@
 #include "watcher/whitelist_watcher.hpp"
 
 using std::list;
+using std::make_move_iterator;
 using std::reference_wrapper;
 using std::set;
 using std::shared_ptr;
@@ -147,8 +149,6 @@ using mesos::authorization::VIEW_EXECUTOR;
 using mesos::master::contender::MasterContender;
 
 using mesos::master::detector::MasterDetector;
-
-using mesos::internal::ResourceQuantities;
 
 static bool isValidFailoverTimeout(const FrameworkInfo& frameworkInfo);
 
@@ -390,7 +390,7 @@ Master::Master(
 Master::~Master() {}
 
 
-hashset<string> Master::misingMinimumCapabilities(
+hashset<string> Master::missingMinimumCapabilities(
     const MasterInfo& masterInfo, const Registry& registry)
 {
   if (registry.minimum_capabilities().size() == 0) {
@@ -1066,14 +1066,6 @@ void Master::initialize()
           logRequest(request);
           return http.unreserve(request, principal);
         });
-  route("/quota",
-        READWRITE_HTTP_AUTHENTICATION_REALM,
-        Http::QUOTA_HELP(),
-        [this](const process::http::Request& request,
-               const Option<Principal>& principal) {
-          logRequest(request);
-          return http.quota(request, principal);
-        });
   route("/weights",
         READWRITE_HTTP_AUTHENTICATION_REALM,
         Http::WEIGHTS_HELP(),
@@ -1081,6 +1073,16 @@ void Master::initialize()
                const Option<Principal>& principal) {
           logRequest(request);
           return http.weights(request, principal);
+        });
+
+  // Deprecated routes:
+  route("/quota",
+        READWRITE_HTTP_AUTHENTICATION_REALM,
+        Http::QUOTA_HELP(),
+        [this](const process::http::Request& request,
+               const Option<Principal>& principal) {
+          logRequest(request);
+          return http.quota(request, principal);
         });
 
   // Provide HTTP assets from a "webui" directory. This is either
@@ -1162,9 +1164,8 @@ void Master::finalize()
       }
     }
 
-    // Remove offers.
     foreach (Offer* offer, utils::copy(slave->offers)) {
-      removeOffer(offer);
+      discardOffer(offer);
     }
 
     // Remove inverse offers.
@@ -1462,7 +1463,7 @@ void Master::consume(MessageEvent&& event)
     // If the framework has a principal, the counter must exist.
     CHECK(metrics->frameworks.contains(principal.get()));
     Counter messages_received =
-      metrics->frameworks.get(principal.get()).get()->messages_received;
+      metrics->frameworks.at(principal.get())->messages_received;
     ++messages_received;
   }
 
@@ -1610,7 +1611,7 @@ void Master::_consume(MessageEvent&& event)
   // this principal.
   if (principal.isSome() && metrics->frameworks.contains(principal.get())) {
     Counter messages_processed =
-      metrics->frameworks.get(principal.get()).get()->messages_processed;
+      metrics->frameworks.at(principal.get())->messages_processed;
     ++messages_processed;
   }
 }
@@ -1674,7 +1675,7 @@ Future<Nothing> Master::recover()
 Future<Nothing> Master::_recover(const Registry& registry)
 {
   hashset<string> missingCapabilities =
-    misingMinimumCapabilities(info_, registry);
+    missingMinimumCapabilities(info_, registry);
 
   if (!missingCapabilities.empty()) {
     LOG(ERROR) << "Master is missing the following minimum capabilities: "
@@ -1695,12 +1696,30 @@ Future<Nothing> Master::_recover(const Registry& registry)
     upgradeResources(&slaveInfo);
 
     slaves.recovered.put(slaveInfo.id(), slaveInfo);
+
+    // Recover the draining and deactivation states.
+    if (slave.has_drain_info()) {
+      slaves.draining[slaveInfo.id()] = slave.drain_info();
+    }
+
+    if (slave.has_deactivated() && slave.deactivated()) {
+      slaves.deactivated.insert(slaveInfo.id());
+    }
   }
 
   foreach (const Registry::UnreachableSlave& unreachable,
            registry.unreachable().slaves()) {
     CHECK(!slaves.unreachable.contains(unreachable.id()));
     slaves.unreachable[unreachable.id()] = unreachable.timestamp();
+
+    // Recover the draining and deactivation states.
+    if (unreachable.has_drain_info()) {
+      slaves.draining[unreachable.id()] = unreachable.drain_info();
+    }
+
+    if (unreachable.has_deactivated() && unreachable.deactivated()) {
+      slaves.deactivated.insert(unreachable.id());
+    }
   }
 
   foreach (const Registry::GoneSlave& gone,
@@ -1729,8 +1748,16 @@ Future<Nothing> Master::_recover(const Registry& registry)
   }
 
   // Save the quotas for each role.
+
+  // First recover from the legacy quota entries.
   foreach (const Registry::Quota& quota, registry.quotas()) {
     quotas[quota.info().role()] = Quota{quota.info()};
+  }
+
+  // Then the new ones.
+  foreach (const quota::QuotaConfig& config, registry.quota_configs()) {
+    CHECK_NOT_CONTAINS(quotas, config.role());
+    quotas[config.role()] = Quota{config};
   }
 
   // We notify the allocator via the `recover()` call. This has to be
@@ -1740,6 +1767,7 @@ Future<Nothing> Master::_recover(const Registry& registry)
   // allocations. An allocator may decide to hold off with allocation
   // until after it restores a view of the cluster state.
   int expectedAgentCount = registry.slaves().slaves().size();
+
   allocator->recover(expectedAgentCount, quotas);
 
   // TODO(alexr): Consider adding a sanity check: whether quotas are
@@ -2378,7 +2406,7 @@ void Master::receive(
   }
 
   if (call.type() == scheduler::Call::SUBSCRIBE) {
-    subscribe(from, call.subscribe());
+    subscribe(from, std::move(*call.mutable_subscribe()));
     return;
   }
 
@@ -2488,6 +2516,10 @@ void Master::receive(
       suppress(framework, call.suppress());
       break;
 
+    case scheduler::Call::UPDATE_FRAMEWORK:
+      updateFramework(from, std::move(*call.mutable_update_framework()));
+      break;
+
     case scheduler::Call::UNKNOWN:
       LOG(WARNING) << "'UNKNOWN' call";
       break;
@@ -2518,7 +2550,7 @@ void Master::registerFramework(
   scheduler::Call::Subscribe call;
   *call.mutable_framework_info() = std::move(frameworkInfo);
 
-  subscribe(from, call);
+  subscribe(from, std::move(call));
 }
 
 
@@ -2546,52 +2578,19 @@ void Master::reregisterFramework(
   *call.mutable_framework_info() = std::move(frameworkInfo);
   call.set_force(reregisterFrameworkMessage.failover());
 
-  subscribe(from, call);
+  subscribe(from, std::move(call));
 }
 
 
-Option<Error> Master::validateFrameworkSubscription(
-  const scheduler::Call::Subscribe& subscribe) const
+Option<Error> Master::validateFramework(
+  const FrameworkInfo& frameworkInfo,
+  const google::protobuf::RepeatedPtrField<std::string>& suppressedRoles) const
 {
-  const FrameworkInfo& frameworkInfo = subscribe.framework_info();
   Option<Error> validationError =
     validation::framework::validate(frameworkInfo);
 
-  if (!validationError.isNone()){
+  if (validationError.isSome()) {
     return validationError;
-  }
-
-  // Validate that resubscribing framework does not attempt
-  // to change its principal.
-  if (frameworkInfo.has_id() && !frameworkInfo.id().value().empty()) {
-    const Framework* framework = getFramework(frameworkInfo.id());
-
-    // TODO(asekretenko): Masters do not store `FrameworkInfo` messages in the
-    // replicated log, so it is possible that the previous principal is still
-    // unknown at the time of re-registration. This has to be changed if we
-    // decide to start storing `FrameworkInfo` messages.
-    if (framework != nullptr) {
-      Option<string> oldPrincipal;
-      if (framework->info.has_principal()) {
-          oldPrincipal = framework->info.principal();
-      }
-
-      Option<string> newPrincipal;
-      if (frameworkInfo.has_principal()) {
-        newPrincipal = frameworkInfo.principal();
-      }
-
-      if (oldPrincipal != newPrincipal) {
-        LOG(WARNING)
-          << "Framework " << frameworkInfo.id() << " which had a principal '"
-          << (oldPrincipal.isSome() ? oldPrincipal.get() : "<NONE>")
-          << "' tried to (re)subscribe with a new principal '"
-          << (newPrincipal.isSome() ? newPrincipal.get() : "<NONE>")
-          << "'";
-
-        return Error("Changing framework's principal is not allowed.");
-      }
-    }
   }
 
   // Check the framework's role(s) against the whitelist.
@@ -2620,7 +2619,7 @@ Option<Error> Master::validateFrameworkSubscription(
   set<string> frameworkRoles = protobuf::framework::getRoles(frameworkInfo);
   // The suppressed roles must be contained within the list of all
   // roles for the framwork.
-  foreach (const string& role, subscribe.suppressed_roles()) {
+  foreach (const string& role, suppressedRoles) {
     if (!frameworkRoles.count(role)) {
       return Error("Suppressed role '" + role +
                    "' is not contained in the list of roles");
@@ -2654,11 +2653,11 @@ Option<Error> Master::validateFrameworkSubscription(
 
 void Master::subscribe(
     StreamingHttpConnection<v1::scheduler::Event> http,
-    const scheduler::Call::Subscribe& subscribe)
+    scheduler::Call::Subscribe&& subscribe)
 {
   // TODO(anand): Authenticate the framework.
 
-  const FrameworkInfo& frameworkInfo = subscribe.framework_info();
+  FrameworkInfo& frameworkInfo = *subscribe.mutable_framework_info();
 
   // Update messages_{re}register_framework accordingly.
   if (!frameworkInfo.has_id() || frameworkInfo.id() == "") {
@@ -2671,7 +2670,7 @@ void Master::subscribe(
             << " HTTP framework '" << frameworkInfo.name() << "'";
 
   Option<Error> validationError =
-    validateFrameworkSubscription(subscribe);
+    validateFramework(frameworkInfo, subscribe.suppressed_roles());
 
   if (validationError.isSome()) {
     LOG(INFO) << "Refusing subscription of framework"
@@ -2686,34 +2685,32 @@ void Master::subscribe(
     return;
   }
 
-  set<string> suppressedRoles = set<string>(
-      subscribe.suppressed_roles().begin(),
-      subscribe.suppressed_roles().end());
-
   // Need to disambiguate for the compiler.
   void (Master::*_subscribe)(
       StreamingHttpConnection<v1::scheduler::Event>,
-      const FrameworkInfo&,
+      FrameworkInfo&&,
       bool,
-      const set<string>&,
+      google::protobuf::RepeatedPtrField<string>&&,
       const Future<bool>&) = &Self::_subscribe;
 
-  authorizeFramework(frameworkInfo)
-    .onAny(defer(self(),
-                 _subscribe,
-                 http,
-                 frameworkInfo,
-                 subscribe.force(),
-                 suppressedRoles,
-                 lambda::_1));
+  Future<bool> authorized = authorizeFramework(frameworkInfo);
+
+  authorized.onAny(
+      defer(self(),
+            _subscribe,
+            http,
+            std::move(frameworkInfo),
+            subscribe.force(),
+            std::move(*subscribe.mutable_suppressed_roles()),
+            lambda::_1));
 }
 
 
 void Master::_subscribe(
     StreamingHttpConnection<v1::scheduler::Event> http,
-    const FrameworkInfo& frameworkInfo,
+    FrameworkInfo&& frameworkInfo,
     bool force,
-    const set<string>& suppressedRoles,
+    google::protobuf::RepeatedPtrField<string>&& suppressedRolesField,
     const Future<bool>& authorized)
 {
   CHECK(!authorized.isDiscarded());
@@ -2745,6 +2742,10 @@ void Master::_subscribe(
             << "' with checkpointing "
             << (frameworkInfo.checkpoint() ? "enabled" : "disabled")
             << " and capabilities " << frameworkInfo.capabilities();
+
+  set<string> suppressedRoles = set<string>(
+      make_move_iterator(suppressedRolesField.begin()),
+      make_move_iterator(suppressedRolesField.end()));
 
   if (!frameworkInfo.has_id() || frameworkInfo.id() == "") {
     // If we are here the framework is subscribing for the first time.
@@ -2791,6 +2792,24 @@ void Master::_subscribe(
 
   CHECK_NOTNULL(framework);
 
+  validation::framework::preserveImmutableFields(
+    framework->info, &frameworkInfo);
+
+  // The new framework info cannot be validated against the current one
+  // before authorization because the current framework info might have been
+  // modified by another concurrent SUBSCRIBE call.
+  // Therefore, we have to do this validation here.
+  Option<Error> updateValidationError = validation::framework::validateUpdate(
+      framework->info, frameworkInfo);
+
+  if (updateValidationError.isSome()) {
+    FrameworkErrorMessage message;
+    message.set_message(updateValidationError->message);
+    http.send(message);
+    http.close();
+    return;
+  }
+
   framework->metrics.incrementCall(scheduler::Call::SUBSCRIBE);
 
   if (!framework->recovered()) {
@@ -2804,38 +2823,33 @@ void Master::_subscribe(
     failoverFramework(framework, http);
   } else {
     // The framework has not yet reregistered after master failover.
-    Try<Nothing> activate = activateRecoveredFramework(
+    activateRecoveredFramework(
         framework, frameworkInfo, None(), http, suppressedRoles);
-
-    if (activate.isError()) {
-      LOG(INFO) << "Could not update FrameworkInfo of framework '"
-                << frameworkInfo.name() << "': " << activate.error();
-
-      FrameworkErrorMessage message;
-      message.set_message(activate.error());
-      http.send(message);
-      http.close();
-      return;
-    }
   }
 
+  sendFrameworkUpdates(*framework);
+}
+
+
+void Master::sendFrameworkUpdates(const Framework& framework)
+{
   if (!subscribers.subscribed.empty()) {
     subscribers.send(
-        protobuf::master::event::createFrameworkUpdated(*framework));
+      protobuf::master::event::createFrameworkUpdated(framework));
   }
 
-  // Broadcast the new framework pid to all the slaves. We have to
-  // broadcast because an executor might be running on a slave but
-  // it currently isn't running any tasks.
+  // Broadcast the new framework info and pid to all the slaves. We have to do
+  // this upon frameworkInfo/pid updates because an executor might be running
+  // on a slave but it currently isn't running any tasks.
   foreachvalue (Slave* slave, slaves.registered) {
     UpdateFrameworkMessage message;
-    message.mutable_framework_id()->CopyFrom(frameworkInfo.id());
+    message.mutable_framework_id()->CopyFrom(framework.id());
 
     // TODO(anand): We set 'pid' to UPID() for http frameworks
     // as 'pid' was made optional in 0.24.0. In 0.25.0, we
     // no longer have to set pid here for http frameworks.
-    message.set_pid(UPID());
-    message.mutable_framework_info()->CopyFrom(frameworkInfo);
+    message.set_pid(framework.pid.getOrElse(UPID()));
+    message.mutable_framework_info()->CopyFrom(framework.info);
     send(slave->pid, message);
   }
 }
@@ -2843,9 +2857,9 @@ void Master::_subscribe(
 
 void Master::subscribe(
     const UPID& from,
-    const scheduler::Call::Subscribe& subscribe)
+    scheduler::Call::Subscribe&& subscribe)
 {
-  FrameworkInfo frameworkInfo = subscribe.framework_info();
+  FrameworkInfo& frameworkInfo = *subscribe.mutable_framework_info();
 
   // Update messages_{re}register_framework accordingly.
   if (!frameworkInfo.has_id() || frameworkInfo.id() == "") {
@@ -2865,16 +2879,16 @@ void Master::subscribe(
               << " because authentication is still in progress";
 
     // Need to disambiguate for the compiler.
-    void (Master::*f)(const UPID&, const scheduler::Call::Subscribe&)
+    void (Master::*f)(const UPID&, scheduler::Call::Subscribe&&)
       = &Self::subscribe;
 
     authenticating[from]
-      .onReady(defer(self(), f, from, subscribe));
+      .onReady(defer(self(), f, from, std::move(subscribe)));
     return;
   }
 
   Option<Error> validationError =
-    validateFrameworkSubscription(subscribe);
+    validateFramework(frameworkInfo, subscribe.suppressed_roles());
 
   // Note that re-authentication errors are already handled above.
   if (validationError.isNone()) {
@@ -2908,34 +2922,32 @@ void Master::subscribe(
     frameworkInfo.set_principal(authenticated[from]);
   }
 
-  set<string> suppressedRoles = set<string>(
-      subscribe.suppressed_roles().begin(),
-      subscribe.suppressed_roles().end());
-
   // Need to disambiguate for the compiler.
   void (Master::*_subscribe)(
       const UPID&,
-      const FrameworkInfo&,
+      FrameworkInfo&&,
       bool,
-      const set<string>&,
+      google::protobuf::RepeatedPtrField<string>&&,
       const Future<bool>&) = &Self::_subscribe;
 
-  authorizeFramework(frameworkInfo)
-    .onAny(defer(self(),
-                 _subscribe,
-                 from,
-                 frameworkInfo,
-                 subscribe.force(),
-                 suppressedRoles,
-                 lambda::_1));
+  Future<bool> authorized = authorizeFramework(frameworkInfo);
+
+  authorized.onAny(
+      defer(self(),
+            _subscribe,
+            from,
+            std::move(frameworkInfo),
+            subscribe.force(),
+            std::move(*subscribe.mutable_suppressed_roles()),
+            lambda::_1));
 }
 
 
 void Master::_subscribe(
     const UPID& from,
-    const FrameworkInfo& frameworkInfo,
+    FrameworkInfo&& frameworkInfo,
     bool force,
-    const set<string>& suppressedRoles,
+    google::protobuf::RepeatedPtrField<string>&& suppressedRolesField,
     const Future<bool>& authorized)
 {
   CHECK(!authorized.isDiscarded());
@@ -2977,6 +2989,10 @@ void Master::_subscribe(
     return;
   }
 
+  set<string> suppressedRoles = set<string>(
+      make_move_iterator(suppressedRolesField.begin()),
+      make_move_iterator(suppressedRolesField.end()));
+
   LOG(INFO) << "Subscribing framework " << frameworkInfo.name()
             << " with checkpointing "
             << (frameworkInfo.checkpoint() ? "enabled" : "disabled")
@@ -3001,10 +3017,9 @@ void Master::_subscribe(
     CHECK(!frameworks.principals.contains(from));
 
     // Assign a new FrameworkID.
-    FrameworkInfo frameworkInfo_ = frameworkInfo;
-    frameworkInfo_.mutable_id()->CopyFrom(newFrameworkId());
+    frameworkInfo.mutable_id()->CopyFrom(newFrameworkId());
 
-    Framework* framework = new Framework(this, flags, frameworkInfo_, from);
+    Framework* framework = new Framework(this, flags, frameworkInfo, from);
 
     addFramework(framework, suppressedRoles);
 
@@ -3053,6 +3068,23 @@ void Master::_subscribe(
 
   CHECK_NOTNULL(framework);
 
+  validation::framework::preserveImmutableFields(
+    framework->info, &frameworkInfo);
+
+  // The new framework info cannot be validated against the current one
+  // before authorization because the current framework info might have been
+  // modified by another concurrent SUBSCRIBE call.
+  // Therefore, we have to do this validation here.
+  Option<Error> updateValidationError = validation::framework::validateUpdate(
+      framework->info, frameworkInfo);
+
+  if (updateValidationError.isSome()) {
+    FrameworkErrorMessage message;
+    message.set_message(updateValidationError->message);
+    send(from, message);
+    return;
+  }
+
   if (!framework->recovered()) {
     // The framework has previously been registered with this master;
     // it may or may not currently be connected.
@@ -3090,26 +3122,16 @@ void Master::_subscribe(
       // if necesssary.
       LOG(INFO) << "Framework " << *framework << " failed over";
       failoverFramework(framework, from);
-
-      if (!subscribers.subscribed.empty()) {
-        subscribers.send(
-            protobuf::master::event::createFrameworkUpdated(*framework));
-      }
     } else {
       LOG(INFO) << "Allowing framework " << *framework
                 << " to subscribe with an already used id";
 
-      // Remove any offers sent to this framework.
+      // Rescind any offers sent to this framework.
       // NOTE: We need to do this because the scheduler might have
       // replied to the offers but the driver might have dropped
       // those messages since it wasn't connected to the master.
       foreach (Offer* offer, utils::copy(framework->offers)) {
-        allocator->recoverResources(
-            offer->framework_id(),
-            offer->slave_id(),
-            offer->resources(),
-            None());
-        removeOffer(offer, true); // Rescind.
+        rescindOffer(offer);
       }
 
       // Also remove inverse offers.
@@ -3142,44 +3164,103 @@ void Master::_subscribe(
       message.mutable_framework_id()->MergeFrom(frameworkInfo.id());
       message.mutable_master_info()->MergeFrom(info_);
       framework->send(message);
-
-      if (!subscribers.subscribed.empty()) {
-        subscribers.send(
-            protobuf::master::event::createFrameworkUpdated(*framework));
-      }
-      return;
     }
   } else {
     // The framework has not yet reregistered after master failover.
-    Try<Nothing> activate = activateRecoveredFramework(
+    activateRecoveredFramework(
         framework, frameworkInfo, from, None(), suppressedRoles);
-
-    if (activate.isError()) {
-      LOG(INFO) << "Could not update FrameworkInfo of framework '"
-                << frameworkInfo.name() << "': " << activate.error();
-
-      FrameworkErrorMessage message;
-      message.set_message(activate.error());
-      send(from, message);
-      return;
-    }
-
-    if (!subscribers.subscribed.empty()) {
-      subscribers.send(
-          protobuf::master::event::createFrameworkUpdated(*framework));
-    }
   }
 
-  // Broadcast the new framework pid to all the slaves. We have to
-  // broadcast because an executor might be running on a slave but
-  // it currently isn't running any tasks.
-  foreachvalue (Slave* slave, slaves.registered) {
-    UpdateFrameworkMessage message;
-    message.mutable_framework_id()->CopyFrom(frameworkInfo.id());
-    message.set_pid(from);
-    message.mutable_framework_info()->CopyFrom(frameworkInfo);
-    send(slave->pid, message);
+  sendFrameworkUpdates(*framework);
+}
+
+
+void Master::updateFramework(
+    const process::UPID& from,
+    mesos::scheduler::Call::UpdateFramework&& call)
+{
+  FrameworkID frameworkId = call.framework_info().id();
+
+  updateFramework(std::move(call))
+    .onAny(defer(self(), [this, from, frameworkId](
+             const Future<process::http::Response>& response) {
+      if (response->code != process::http::Status::OK) {
+        CHECK_EQ(response->type, process::http::Response::BODY);
+        FrameworkErrorMessage message;
+        message.set_message(response->body);
+        send(from, message);
+      }
+    }));
+}
+
+
+Future<process::http::Response> Master::updateFramework(
+    mesos::scheduler::Call::UpdateFramework&& call)
+{
+  Option<Error> error =
+    validateFramework(call.framework_info(), call.suppressed_roles());
+
+  if (error.isSome()) {
+    return process::http::BadRequest(
+        "Supplied FrameworkInfo is not valid: " + error->message);
   }
+
+  LOG(INFO) << "Processing UPDATE_FRAMEWORK call for framework "
+            << call.framework_info().id();
+
+  Future<bool> authorized = authorizeFramework(call.framework_info());
+
+  return authorized
+    .then(defer(self(), &Self::_updateFramework, std::move(call), lambda::_1));
+}
+
+
+Future<process::http::Response> Master::_updateFramework(
+    mesos::scheduler::Call::UpdateFramework&& call,
+    const Future<bool>& authorized)
+{
+  if (authorized.isFailed()) {
+    return process::http::BadRequest(
+        "Authorization failure: " + authorized.failure());
+  }
+
+  // TODO(asekretenko): We should make it possible for the authorizer to return
+  // the exact cause of declined authorization, after which we can simply
+  // forward it here.
+  if (!authorized.get()) {
+    return process::http::Forbidden(
+        "Not authorized to use roles '" +
+        stringify(protobuf::framework::getRoles(call.framework_info())) + "'");
+  }
+
+  Framework* framework = getFramework(call.framework_info().id());
+
+  // TODO(asekretenko): Test against the race with framework removal.
+  if (framework == nullptr) {
+    return process::http::Conflict(
+        "Framework was removed while this call was being processed");
+  }
+
+  // We need to validate the FrameworkInfo update here
+  // to avoid races with SUBSCRIBE or another UPDATE_FRAMEWORK call.
+  //
+  // TODO(asekretenko): Test against these races.
+  Option<Error> error = validation::framework::validateUpdate(
+    framework->info, call.framework_info());
+
+  if (error.isSome()) {
+    return process::http::BadRequest(
+        "FrameworkInfo update is not valid: " + error->message);
+  }
+
+  set<string> suppressedRoles(
+    make_move_iterator(call.mutable_suppressed_roles()->begin()),
+    make_move_iterator(call.mutable_suppressed_roles()->end()));
+
+  updateFramework(framework, call.framework_info(), suppressedRoles);
+  sendFrameworkUpdates(*framework);
+
+  return process::http::OK();
 }
 
 
@@ -3281,13 +3362,11 @@ void Master::deactivate(Framework* framework, bool rescind)
 
   // Remove the framework's offers.
   foreach (Offer* offer, utils::copy(framework->offers)) {
-    allocator->recoverResources(
-        offer->framework_id(),
-        offer->slave_id(),
-        offer->resources(),
-        None());
-
-    removeOffer(offer, rescind);
+    if (rescind) {
+      rescindOffer(offer);
+    } else {
+      discardOffer(offer);
+    }
   }
 
   // Remove the framework's inverse offers.
@@ -3334,15 +3413,8 @@ void Master::deactivate(Slave* slave)
 
   allocator->deactivateSlave(slave->id);
 
-  // Remove and rescind offers.
   foreach (Offer* offer, utils::copy(slave->offers)) {
-    allocator->recoverResources(
-        offer->framework_id(),
-        slave->id,
-        offer->resources(),
-        None());
-
-    removeOffer(offer, true); // Rescind!
+    rescindOffer(offer);
   }
 
   // Remove and rescind inverse offers.
@@ -3357,6 +3429,18 @@ void Master::deactivate(Slave* slave)
 
     removeInverseOffer(inverseOffer, true); // Rescind!
   }
+}
+
+
+void Master::reactivate(Slave* slave)
+{
+  CHECK_NOTNULL(slave);
+  CHECK(!slaves.deactivated.contains(slave->id));
+
+  LOG(INFO) << "Reactivating agent " << *slave;
+
+  slave->active = true;
+  allocator->activateSlave(slave->id);
 }
 
 
@@ -3448,46 +3532,59 @@ void Master::suppress(
 }
 
 
-vector<string> Master::filterRoles(
-    const Owned<ObjectApprovers>& approvers) const
+vector<string> Master::knownRoles() const
 {
-  JSON::Object object;
-
-  // Compute the role names to return results for. When an explicit
-  // role whitelist has been configured, we use that list of names.
-  // When using implicit roles, the right behavior is a bit more
-  // subtle. There are no constraints on possible role names, so we
-  // instead list all the "interesting" roles: all roles with one or
-  // more registered frameworks, and all roles with a non-default
-  // weight or quota.
-  //
   // NOTE: we use a `std::set` to store the role names to ensure a
   // deterministic output order.
   set<string> roleList;
+
+  auto insertAncestors = [&roleList](const string& role) {
+    foreach (const string& ancestor, roles::ancestors(role)) {
+      bool inserted = roleList.insert(ancestor).second;
+
+      // We can break here as an optimization since the ancestor
+      // will have had its ancestors inserted already.
+      if (!inserted) break;
+    }
+  };
+
   if (roleWhitelist.isSome()) {
-    const hashset<string>& whitelist = roleWhitelist.get();
-    roleList.insert(whitelist.begin(), whitelist.end());
+    foreach (const string& role, *this->roleWhitelist) {
+      roleList.insert(role);
+      insertAncestors(role);
+    }
   } else {
-    hashset<string> roles = this->roles.keys();
-    roleList.insert(roles.begin(), roles.end());
+    // In terms of building a complete set of known roles, we have to visit:
+    //   (1) all entries of `roles` (which means there are frameworks
+    //       subscribed to a role or have allocations to a role)
+    //   (2) all reservation roles
+    //   (3) all roles with configured weights or quotas
+    //   (4) all ancestor roles of (1), (2), and (3).
 
-    hashset<string> weights = this->weights.keys();
-    roleList.insert(weights.begin(), weights.end());
+    foreachkey (const string& role, this->roles) {
+      roleList.insert(role);
+      insertAncestors(role);
+    }
 
-    hashset<string> quotas = this->quotas.keys();
-    roleList.insert(quotas.begin(), quotas.end());
-  }
+    foreachvalue (Slave* slave, this->slaves.registered) {
+      foreachkey (const string& role, slave->totalResources.reservations()) {
+        roleList.insert(role);
+        insertAncestors(role);
+      }
+    }
 
-  vector<string> filteredRoleList;
-  filteredRoleList.reserve(roleList.size());
+    foreachkey (const string& role, this->weights) {
+      roleList.insert(role);
+      insertAncestors(role);
+    }
 
-  foreach (const string& role, roleList) {
-    if (approvers->approved<VIEW_ROLE>(role)) {
-      filteredRoleList.push_back(role);
+    foreachkey (const string& role, this->quotas) {
+      roleList.insert(role);
+      insertAncestors(role);
     }
   }
 
-  return filteredRoleList;
+  return vector<string>(roleList.begin(), roleList.end());
 }
 
 
@@ -3498,6 +3595,66 @@ bool Master::isWhitelistedRole(const string& name) const
   }
 
   return roleWhitelist->contains(name);
+}
+
+
+ResourceQuantities Master::RoleResourceBreakdown::offered() const
+{
+  ResourceQuantities result;
+
+  foreachvalue (Framework* framework, master->frameworks.registered) {
+    result += ResourceQuantities::fromResources(
+        framework->totalOfferedResources.allocatedToRoleSubtree(role));
+  }
+
+  return result;
+}
+
+
+ResourceQuantities Master::RoleResourceBreakdown::allocated() const
+{
+  ResourceQuantities result;
+
+  foreachvalue (Framework* framework, master->frameworks.registered) {
+    result += ResourceQuantities::fromResources(
+        framework->totalUsedResources.allocatedToRoleSubtree(role));
+  }
+
+  return result;
+}
+
+
+ResourceQuantities Master::RoleResourceBreakdown::reserved() const
+{
+  ResourceQuantities result;
+
+  foreachvalue (Slave* slave, master->slaves.registered) {
+    result += ResourceQuantities::fromResources(
+        slave->totalResources.reservedToRoleSubtree(role));
+  }
+
+  return result;
+}
+
+
+ResourceQuantities Master::RoleResourceBreakdown::consumedQuota() const
+{
+  ResourceQuantities unallocatedReservation;
+
+  foreachvalue (Slave* slave, master->slaves.registered) {
+    ResourceQuantities totalReservation = ResourceQuantities::fromResources(
+        slave->totalResources.reservedToRoleSubtree(role));
+
+    ResourceQuantities usedReservation;
+    foreachvalue (const Resources& r, slave->usedResources) {
+      usedReservation += ResourceQuantities::fromResources(
+          r.reservedToRoleSubtree(role));
+    }
+
+    unallocatedReservation += totalReservation - usedReservation;
+  }
+
+  return allocated() + unallocatedReservation;
 }
 
 
@@ -4163,74 +4320,42 @@ void Master::accept(
     // TODO(jieyu): Add metrics for non launch operations.
   }
 
-  // TODO(bmahler): We currently only support using multiple offers
-  // for a single slave.
-  Resources offeredResources;
-  Option<SlaveID> slaveId = None();
   Option<Error> error = None();
-  Option<Resource::AllocationInfo> allocationInfo = None();
 
   if (accept.offer_ids().size() == 0) {
     error = Error("No offers specified");
   } else {
     // Validate the offers.
     error = validation::offer::validate(accept.offer_ids(), this, framework);
+  }
 
-    size_t offersAccepted = 0;
+  if (error.isSome()) {
+    // TODO(jieyu): Consider adding a 'drop' overload for ACCEPT call to
+    // consistently handle message dropping. It would be ideal if the
+    // 'drop' overload can handle both resource recovery and lost task
+    // notifications.
 
-    // Compute offered resources and remove the offers. If the
-    // validation failed, return resources to the allocator.
+    // Discard existing offers.
     foreach (const OfferID& offerId, accept.offer_ids()) {
       Offer* offer = getOffer(offerId);
       if (offer != nullptr) {
-        // Don't bother adding resources to `offeredResources` in case
-        // validation failed; just recover them.
-        if (error.isSome()) {
-          allocator->recoverResources(
-              offer->framework_id(),
-              offer->slave_id(),
-              offer->resources(),
-              None());
-        } else {
-          slaveId = offer->slave_id();
-          allocationInfo = offer->allocation_info();
-          offeredResources += offer->resources();
-
-          offersAccepted++;
-        }
-
-        removeOffer(offer);
-        continue;
+        discardOffer(offer);
+      } else {
+        // If the offer was not in our offer set, then this offer is no
+        // longer valid.
+        LOG(WARNING) << "Ignoring accept of offer " << offerId
+                     << " since it is no longer valid";
       }
-
-      // If the offer was not in our offer set, then this offer is no
-      // longer valid.
-      LOG(WARNING) << "Ignoring accept of offer " << offerId
-                   << " since it is no longer valid";
     }
 
-    framework->metrics.offers_accepted += offersAccepted;
-  }
-
-  // If invalid, send TASK_DROPPED for the launch attempts. If the
-  // framework is not partition-aware, send TASK_LOST instead. If
-  // other operations have their `id` field set, then send
-  // OPERATION_ERROR updates for them.
-  //
-  // TODO(jieyu): Consider adding a 'drop' overload for ACCEPT call to
-  // consistently handle message dropping. It would be ideal if the
-  // 'drop' overload can handle both resource recovery and lost task
-  // notifications.
-  if (error.isSome()) {
     LOG(WARNING) << "ACCEPT call used invalid offers '" << accept.offer_ids()
                  << "': " << error->message;
 
-    TaskState newTaskState = TASK_DROPPED;
-    if (!framework->capabilities.partitionAware) {
-      newTaskState = TASK_LOST;
-    }
+    const TaskState newTaskState =
+      framework->capabilities.partitionAware ? TASK_DROPPED : TASK_LOST;
 
     foreach (const Offer::Operation& operation, accept.operations()) {
+      // Send OPERATION_ERROR for non-LAUNCH operations
       if (operation.type() != Offer::Operation::LAUNCH &&
           operation.type() != Offer::Operation::LAUNCH_GROUP) {
         drop(framework,
@@ -4239,6 +4364,7 @@ void Master::accept(
         continue;
       }
 
+      // Send task status updates for launch attempts.
       const RepeatedPtrField<TaskInfo>& tasks = [&]() {
         if (operation.type() == Offer::Operation::LAUNCH) {
           return operation.launch().task_infos();
@@ -4277,9 +4403,34 @@ void Master::accept(
     return;
   }
 
-  CHECK_SOME(slaveId);
-  Slave* slave = slaves.registered.get(slaveId.get());
-  CHECK_NOTNULL(slave);
+  // From now on, we are handling the valid offers case.
+
+  // Get slave id and allocation info from some existing offer
+  // (as they are valid, they must have the same slave id and allocation info).
+  const Offer* existingOffer = ([this](const RepeatedPtrField<OfferID>& ids) {
+    for (const OfferID& id : ids) {
+      const Offer* offer = getOffer(id);
+      if (offer != nullptr) {
+        return offer;
+      }
+    }
+
+    LOG(FATAL) << "No validated offer_ids correspond to existing offers";
+  })(accept.offer_ids());
+
+  // TODO(bmahler): We currently only support using multiple offers
+  // for a single slave.
+  SlaveID slaveId = existingOffer->slave_id();
+
+  // TODO(asekretenko): The code below is copying AllocationInfo (and later
+  // injecting it into operations) as a whole, but only the 'role' field is
+  // subject to offer validation. As for now, this works fine, because
+  // AllocationInfo has no other fields. However, this is fragile and can
+  // silently break if more fields are added to AllocationInfo.
+  Resource::AllocationInfo allocationInfo = existingOffer->allocation_info();
+
+  Slave* slave = slaves.registered.get(slaveId);
+  CHECK(slave != nullptr) << slaveId;
 
   // Validate and upgrade all of the resources in `accept.operations`:
   //
@@ -4436,7 +4587,7 @@ void Master::accept(
               drop(framework,
                    operation,
                    "Operation requested feedback, but agent " +
-                   stringify(slaveId.get()) +
+                   stringify(slaveId) +
                    " does not have the required RESOURCE_PROVIDER capability");
               break;
             }
@@ -4447,7 +4598,7 @@ void Master::accept(
               drop(framework,
                    operation,
                    "Operation on agent default resources requested feedback,"
-                   " but agent " + stringify(slaveId.get()) +
+                   " but agent " + stringify(slaveId) +
                    " does not have the required AGENT_OPERATION_FEEDBACK and"
                    " RESOURCE_PROVIDER capabilities");
               break;
@@ -4477,8 +4628,7 @@ void Master::accept(
     // within an offer now contain an `AllocationInfo`. We therefore
     // inject the offer's allocation info into the operation's
     // resources if the scheduler has not done so already.
-    CHECK_SOME(allocationInfo);
-    protobuf::injectAllocationInfo(&operation, allocationInfo.get());
+    protobuf::injectAllocationInfo(&operation, allocationInfo);
 
     switch (operation.type()) {
       case Offer::Operation::RESERVE:
@@ -4729,8 +4879,7 @@ void Master::accept(
     .onAny(defer(self(),
                  &Master::_accept,
                  framework->id(),
-                 slaveId.get(),
-                 offeredResources,
+                 slaveId,
                  std::move(accept),
                  lambda::_1));
 }
@@ -4739,10 +4888,18 @@ void Master::accept(
 void Master::_accept(
     const FrameworkID& frameworkId,
     const SlaveID& slaveId,
-    const Resources& offeredResources,
     scheduler::Call::Accept&& accept,
     const Future<vector<Future<bool>>>& _authorizations)
 {
+  auto discardOffers = [this](const RepeatedPtrField<OfferID>& ids) {
+    for (const OfferID& offerId : ids) {
+      Offer* offer = getOffer(offerId);
+      if (offer != nullptr) {
+        discardOffer(offer);
+      }
+    }
+  };
+
   Framework* framework = getFramework(frameworkId);
 
   // TODO(jieyu): Consider using the 'drop' overload mentioned in
@@ -4752,13 +4909,9 @@ void Master::_accept(
       << "Ignoring ACCEPT call for framework " << frameworkId
       << " because the framework cannot be found";
 
-    // Tell the allocator about the recovered resources.
-    allocator->recoverResources(
-        frameworkId,
-        slaveId,
-        offeredResources,
-        None());
-
+    // TODO(asekretenko): consider replacing this with a CHECK that there
+    // never are any offers for a non-active (inactive/completed/...) framework.
+    discardOffers(accept.offer_ids());
     return;
   }
 
@@ -4823,34 +4976,48 @@ void Master::_accept(
       }
     }
 
-    // Tell the allocator about the recovered resources.
-    allocator->recoverResources(
-        frameworkId,
-        slaveId,
-        offeredResources,
-        None());
-
+    // TODO(asekretenko): consider replacing this with a CHECK that there
+    // never are any offers for a removed/disconnected slave.
+    discardOffers(accept.offer_ids());
     return;
   }
 
-  // Some operations update the offered resources. We keep
-  // updated offered resources here. When a task is successfully
-  // launched, we remove its resource from offered resources.
-  Resources _offeredResources = offeredResources;
+  Resources offeredResources;
+  size_t offersAccepted = 0;
+
+  foreach (const OfferID& offerId, accept.offer_ids()) {
+    Offer* offer = getOffer(offerId);
+    if (offer == nullptr) {
+      LOG(WARNING) << "Ignoring accept of offer " << offerId
+                   << " since it is no longer valid";
+      continue;
+    }
+    offeredResources += offer->resources();
+    ++offersAccepted;
+
+    _removeOffer(framework, offer);
+  }
+
+  framework->metrics.offers_accepted += offersAccepted;
+
+  // We maintain the "running remaining" resources here to support pipelining of
+  // speculative operations (e.g., RESERVE), which would modify the remaining
+  // resources. Resources consumed by non-speculative operations (e.g., LAUNCH)
+  // are removed from the remaining resources.
+  Resources remainingResources = offeredResources;
 
   // Converted resources from volume resizes. These converted resources are not
-  // put into `_offeredResources`, so no other operations can consume them.
+  // put into `remainingResources`, so no other operations can consume them.
   // TODO(zhitao): This will be unnecessary once `GROW_VOLUME` and
   // `SHRINK_VOLUME` become non-speculative.
   Resources resizedResources;
 
-  // We keep track of the shared resources from the offers separately.
-  // `offeredSharedResources` can be modified by CREATE/DESTROY but we
-  // don't remove from it when a task is successfully launched so this
-  // variable always tracks the *total* amount. We do this to support
-  // validation of tasks involving shared resources. See comments in
-  // the LAUNCH case below.
-  Resources offeredSharedResources = offeredResources.shared();
+  // We keep track of the "running remaining" shared resources from the offers
+  // separately. `remainingSharedResources` can be modified by CREATE/DESTROY
+  // but we don't remove from it when a task is successfully launched so this
+  // variable always tracks the *total* amount. We do this to support validation
+  // of tasks involving shared resources. See comments in the LAUNCH case below.
+  Resources remainingSharedResources = offeredResources.shared();
 
   // Maintain a list of resource conversions to pass to the allocator
   // as a result of operations. Note that:
@@ -4927,13 +5094,13 @@ void Master::_accept(
           continue;
         }
 
-        Try<Resources> resources = _offeredResources.apply(_conversions.get());
+        Try<Resources> resources = remainingResources.apply(_conversions.get());
         if (resources.isError()) {
           drop(framework, operation, resources.error());
           continue;
         }
 
-        _offeredResources = resources.get();
+        remainingResources = resources.get();
 
         LOG(INFO) << "Applying RESERVE operation for resources "
                   << operation.reserve().resources() << " from framework "
@@ -4994,13 +5161,13 @@ void Master::_accept(
           continue;
         }
 
-        Try<Resources> resources = _offeredResources.apply(_conversions.get());
+        Try<Resources> resources = remainingResources.apply(_conversions.get());
         if (resources.isError()) {
           drop(framework, operation, resources.error());
           continue;
         }
 
-        _offeredResources = resources.get();
+        remainingResources = resources.get();
 
         LOG(INFO) << "Applying UNRESERVE operation for resources "
                   << operation.unreserve().resources() << " from framework "
@@ -5071,14 +5238,14 @@ void Master::_accept(
           continue;
         }
 
-        Try<Resources> resources = _offeredResources.apply(_conversions.get());
+        Try<Resources> resources = remainingResources.apply(_conversions.get());
         if (resources.isError()) {
           drop(framework, operation, resources.error());
           continue;
         }
 
-        _offeredResources = resources.get();
-        offeredSharedResources = _offeredResources.shared();
+        remainingResources = resources.get();
+        remainingSharedResources = remainingResources.shared();
 
         LOG(INFO) << "Applying CREATE operation for volumes "
                   << operation.create().volumes() << " from framework "
@@ -5140,13 +5307,7 @@ void Master::_accept(
 
           foreach (const Resource& volume, operation.destroy().volumes()) {
             if (offered.contains(volume)) {
-              allocator->recoverResources(
-                  offer->framework_id(),
-                  offer->slave_id(),
-                  offered,
-                  None());
-
-              removeOffer(offer, true);
+              rescindOffer(offer);
 
               // This offer may contain other volumes that are being destroyed.
               // However, we have already rescinded it, so we should move on
@@ -5165,14 +5326,14 @@ void Master::_accept(
           continue;
         }
 
-        Try<Resources> resources = _offeredResources.apply(_conversions.get());
+        Try<Resources> resources = remainingResources.apply(_conversions.get());
         if (resources.isError()) {
           drop(framework, operation, resources.error());
           continue;
         }
 
-        _offeredResources = resources.get();
-        offeredSharedResources = _offeredResources.shared();
+        remainingResources = resources.get();
+        remainingSharedResources = remainingResources.shared();
 
         LOG(INFO) << "Applying DESTROY operation for volumes "
                   << operation.destroy().volumes() << " from framework "
@@ -5240,18 +5401,18 @@ void Master::_accept(
         const Resources& consumed = _conversions->at(0).consumed;
         const Resources& converted = _conversions->at(0).converted;
 
-        if (!_offeredResources.contains(consumed)) {
+        if (!remainingResources.contains(consumed)) {
           drop(
               framework,
               operation,
               "Invalid GROW_VOLUME operation: " +
-              stringify(_offeredResources) + " does not contain " +
+              stringify(remainingResources) + " does not contain " +
               stringify(consumed));
 
           continue;
         }
 
-        _offeredResources -= consumed;
+        remainingResources -= consumed;
         resizedResources += converted;
 
         LOG(INFO) << "Processing GROW_VOLUME operation for volume "
@@ -5323,18 +5484,18 @@ void Master::_accept(
         const Resources& consumed = _conversions->at(0).consumed;
         const Resources& converted = _conversions->at(0).converted;
 
-        if (!_offeredResources.contains(consumed)) {
+        if (!remainingResources.contains(consumed)) {
           drop(
               framework,
               operation,
               "Invalid SHRINK_VOLUME operation: " +
-              stringify(_offeredResources) + " does not contain " +
+              stringify(remainingResources) + " does not contain " +
               stringify(consumed));
 
           continue;
         }
 
-        _offeredResources -= consumed;
+        remainingResources -= consumed;
         resizedResources += converted;
 
         LOG(INFO) << "Processing SHRINK_VOLUME operation for volume "
@@ -5424,7 +5585,7 @@ void Master::_accept(
           // of a shared persistent volume from the offer; 3 tasks can be
           // launched on 2 copies of a shared persistent volume from 2 offers.
           Resources available =
-            _offeredResources.nonShared() + offeredSharedResources;
+            remainingResources.nonShared() + remainingSharedResources;
 
           Option<Error> error =
             validation::task::validate(task, framework, slave, available);
@@ -5485,10 +5646,10 @@ void Master::_accept(
             // of each consumed shared resource (guaranteed by master
             // validation).
             foreach (const Resource& resource, consumedShared) {
-              CHECK(offeredSharedResources.contains(resource));
+              CHECK(remainingSharedResources.contains(resource));
             }
 
-            Resources additional = consumedShared - _offeredResources.shared();
+            Resources additional = consumedShared - remainingResources.shared();
             if (!additional.empty()) {
               LOG(INFO) << "Allocating additional resources " << additional
                         << " for task " << task.task_id()
@@ -5498,7 +5659,7 @@ void Master::_accept(
               conversions.emplace_back(Resources(), additional);
             }
 
-            _offeredResources -= consumed;
+            remainingResources -= consumed;
 
             RunTaskMessage message;
             message.mutable_framework()->MergeFrom(framework->info);
@@ -5632,7 +5793,7 @@ void Master::_accept(
           reason = TaskStatus::REASON_TASK_GROUP_UNAUTHORIZED;
         } else {
           error = validation::task::group::validate(
-              taskGroup, executor, framework, slave, _offeredResources);
+              taskGroup, executor, framework, slave, remainingResources);
 
           if (error.isSome()) {
             reason = TaskStatus::REASON_TASK_GROUP_INVALID;
@@ -5754,10 +5915,10 @@ void Master::_accept(
           }
         }
 
-        CHECK(_offeredResources.contains(totalResources))
-          << _offeredResources << " does not contain " << totalResources;
+        CHECK(remainingResources.contains(totalResources))
+          << remainingResources << " does not contain " << totalResources;
 
-        _offeredResources -= totalResources;
+        remainingResources -= totalResources;
 
         // If the agent does not support reservation refinement, downgrade
         // the task and executor resources to the "pre-reservation-refinement"
@@ -5830,16 +5991,16 @@ void Master::_accept(
 
         const Resource& consumed = operation.create_disk().source();
 
-        if (!_offeredResources.contains(consumed)) {
+        if (!remainingResources.contains(consumed)) {
           drop(framework,
                operation,
                "Invalid CREATE_DISK Operation: " +
-                 stringify(_offeredResources) + " does not contain " +
+                 stringify(remainingResources) + " does not contain " +
                  stringify(consumed));
           continue;
         }
 
-        _offeredResources -= consumed;
+        remainingResources -= consumed;
 
         LOG(INFO) << "Processing CREATE_DISK operation with source "
                   << operation.create_disk().source() << " from framework "
@@ -5897,16 +6058,16 @@ void Master::_accept(
 
         const Resource& consumed = operation.destroy_disk().source();
 
-        if (!_offeredResources.contains(consumed)) {
+        if (!remainingResources.contains(consumed)) {
           drop(framework,
                operation,
                "Invalid DESTROY_DISK Operation: " +
-                 stringify(_offeredResources) + " does not contain " +
+                 stringify(remainingResources) + " does not contain " +
                  stringify(consumed));
           continue;
         }
 
-        _offeredResources -= consumed;
+        remainingResources -= consumed;
 
         LOG(INFO) << "Processing DESTROY_DISK operation for volume "
                   << operation.destroy_disk().source() << " from framework "
@@ -5946,8 +6107,8 @@ void Master::_accept(
   //   = (offered resources).apply(speculative operations)
   //       - resources consumed by non-speculative operations
   //       - offered resources not consumed by any operation
-  //   = `_offeredResources` - offered resources not consumed by any operation
-  //   = `_offeredResources` - offered resources
+  //   = remaining resources - offered resources not consumed by any operation
+  //   = remaining resources - offered resources
   //
   // (The last equality holds because resource subtraction yields no negatives.)
   //
@@ -5955,15 +6116,15 @@ void Master::_accept(
   //   = (offered resources).apply(speculative operations)
   //       - resources consumed by non-speculative operations
   //       - speculatively converted resources
-  //   = `_offeredResources` - speculatively converted resources
+  //   = remaining resources - speculatively converted resources
   //
   // TODO(zhitao): Right now `GROW_VOLUME` and `SHRINK_VOLUME` are implemented
   // as speculative operations. Since the plan is to make them non-speculative
-  // in the future, their results are not in `_offeredResources`, so we add them
-  // back here. Remove this once the operations become non-speculative.
+  // in the future, their results are not in the remaining resources, so we add
+  // them back here. Remove this once the operations become non-speculative.
   Resources speculativelyConverted =
-    _offeredResources + resizedResources - offeredResources;
-  Resources implicitlyDeclined = _offeredResources - speculativelyConverted;
+    remainingResources + resizedResources - offeredResources;
+  Resources implicitlyDeclined = remainingResources - speculativelyConverted;
 
   // Prevent any allocations from occurring during resource recovery below.
   allocator->pause();
@@ -6057,18 +6218,10 @@ void Master::decline(
 
   size_t offersDeclined = 0;
 
-  //  Return resources to the allocator.
   foreach (const OfferID& offerId, decline.offer_ids()) {
     Offer* offer = getOffer(offerId);
     if (offer != nullptr) {
-      allocator->recoverResources(
-          offer->framework_id(),
-          offer->slave_id(),
-          offer->resources(),
-          decline.filters());
-
-      removeOffer(offer);
-
+      discardOffer(offer, decline.filters());
       offersDeclined++;
       continue;
     }
@@ -6121,6 +6274,85 @@ void Master::declineInverseOffers(
     // offer is no longer valid.
     LOG(WARNING) << "Ignoring decline of inverse offer " << offerId
                  << " since it is no longer valid";
+  }
+}
+
+
+void Master::checkAndTransitionDrainingAgent(Slave* slave)
+{
+  CHECK_NOTNULL(slave);
+
+  const SlaveID& slaveId = slave->id;
+
+  if (!slaves.draining.contains(slaveId) ||
+      slaves.draining.at(slaveId).state() == DRAINED) {
+    // Nothing to do for non-draining or already drained agents.
+    return;
+  }
+
+  // Check if the agent has any tasks running or operations pending.
+  if (!slave->pendingTasks.empty() ||
+      !slave->tasks.empty() ||
+      !slave->operations.empty()) {
+    VLOG(1)
+      << "DRAINING Agent " << slaveId << " has "
+      << slave->pendingTasks.size() << " pending tasks, "
+      << slave->tasks.size() << " tasks, and "
+      << slave->operations.size() << " operations";
+    return;
+  }
+
+  if (slaves.markingGone.contains(slaveId)) {
+    LOG(INFO)
+      << "Ignoring transition of agent " << slaveId << " to the DRAINED"
+      << " state because agent is being marked gone";
+    return;
+  }
+
+  // If the agent will be marked gone afterwards, we do not need to mark
+  // the agent as DRAINED. Simply marking gone will suffice.
+  if (slaves.draining.at(slaveId).config().mark_gone()) {
+    LOG(INFO) << "Marking agent " << slaveId << " in the DRAINED state as gone";
+
+    slaves.markingGone.insert(slaveId);
+
+    TimeInfo goneTime = protobuf::getCurrentTime();
+
+    registrar->apply(Owned<RegistryOperation>(
+        new MarkSlaveGone(slaveId, goneTime)))
+      .onAny(defer(
+          self(),
+          [this, slaveId, goneTime](const Future<bool>& result) {
+            CHECK_READY(result)
+              << "Failed to mark agent gone in the registry";
+
+            markGone(slaveId, goneTime);
+          }));
+  } else {
+    LOG(INFO) << "Transitioning agent " << slaveId << " to the DRAINED state";
+
+    registrar->apply(Owned<RegistryOperation>(
+        new MarkAgentDrained(slaveId)))
+      .onAny(defer(
+          self(),
+          [this, slaveId](const Future<bool>& result) {
+            CHECK_READY(result)
+              << "Failed to update draining info in the registry";
+
+            // This can happen if the agent sends an UnregisterSlaveMessage
+            // right before this method is called.
+            if (!slaves.draining.contains(slaveId)) {
+              LOG(INFO)
+                << "Agent " << slaveId << " was removed while being"
+                << " marked as DRAINED";
+              return;
+            }
+
+            slaves.draining[slaveId].set_state(DRAINED);
+
+            LOG(INFO)
+              << "Agent " << slaveId << " successfully marked as DRAINED";
+          }));
   }
 }
 
@@ -6489,6 +6721,8 @@ void Master::acknowledge(
   send(slave->pid, message);
 
   metrics->valid_status_update_acknowledgements++;
+
+  checkAndTransitionDrainingAgent(slave);
 }
 
 
@@ -6620,6 +6854,8 @@ void Master::acknowledgeOperationStatus(
   send(slave->pid, message);
 
   metrics->valid_operation_status_update_acknowledgements++;
+
+  checkAndTransitionDrainingAgent(slave);
 }
 
 
@@ -6988,9 +7224,6 @@ void Master::_registerSlave(
                   "a new agent registered at the same address",
                   metrics->slave_removals_reason_registered);
     } else {
-      CHECK(slave->active)
-        << "Unexpected connected but deactivated agent " << *slave;
-
       LOG(INFO) << "Agent " << *slave << " already registered,"
                 << " resending acknowledgement";
 
@@ -7688,6 +7921,30 @@ void Master::__reregisterSlave(
 
   addSlave(slave, std::move(completedFrameworks));
 
+  // If this agent was deactivated, make sure to deactivate it again,
+  // now that it has reregistered.
+  if (slaves.deactivated.contains(slaveInfo.id())) {
+    deactivate(slave);
+  }
+
+  // If this is a draining agent, send it the drain message.
+  // We do this regardless of the draining state (DRAINING or DRAINED),
+  // because the agent is expected to handle the message in either state.
+  if (slaves.draining.contains(slaveInfo.id())) {
+    DrainSlaveMessage message;
+    message.mutable_config()->CopyFrom(
+        slaves.draining.at(slaveInfo.id()).config());
+
+    send(slave->pid, message);
+
+    // NOTE: If the agent supports resource providers, the agent will not
+    // report pending operations until the agent's first UpdateSlaveMessage.
+    // Therefore, we cannot check the agent's drain state here.
+    if (!slaveCapabilities.resourceProvider) {
+      checkAndTransitionDrainingAgent(slave);
+    }
+  }
+
   Duration pingTimeout =
     flags.agent_ping_timeout * flags.max_agent_ping_timeouts;
   MasterSlaveConnection connection;
@@ -7799,6 +8056,7 @@ void Master::___reregisterSlave(
   const string& version = reregisterSlaveMessage.version();
   const vector<SlaveInfo::Capability> agentCapabilities =
     google::protobuf::convert(reregisterSlaveMessage.agent_capabilities());
+  protobuf::slave::Capabilities slaveCapabilities(agentCapabilities);
 
   Option<UUID> resourceVersion;
   if (reregisterSlaveMessage.has_resource_version_uuid()) {
@@ -7867,12 +8125,28 @@ void Master::___reregisterSlave(
     slave->connected = true;
     dispatch(slave->observer, &SlaveObserver::reconnect);
 
-    slave->active = true;
-    allocator->activateSlave(slave->id);
+    if (!slaves.deactivated.contains(slave->id)) {
+      reactivate(slave);
+    }
   }
 
-  CHECK(slave->active)
-    << "Unexpected connected but deactivated agent " << *slave;
+  // If this is a draining agent, send it the drain message.
+  // We do this regardless of the draining state (DRAINING or DRAINED),
+  // because the agent is expected to handle the message in either state.
+  if (slaves.draining.contains(slaveInfo.id())) {
+    DrainSlaveMessage message;
+    message.mutable_config()->CopyFrom(
+        slaves.draining.at(slaveInfo.id()).config());
+
+    send(slave->pid, message);
+
+    // NOTE: If the agent supports resource providers, the agent will not
+    // report pending operations until the agent's first UpdateSlaveMessage.
+    // Therefore, we cannot check the agent's drain state here.
+    if (!slaveCapabilities.resourceProvider) {
+      checkAndTransitionDrainingAgent(slave);
+    }
+  }
 
   // Inform the agent of the new framework pids for its tasks, and
   // recover any unknown frameworks from the slave info.
@@ -8011,20 +8285,12 @@ void Master::updateFramework(
   // the frameworks from the added/removed roles, respectively.
   allocator->updateFramework(framework->id(), frameworkInfo, suppressedRoles);
 
-  // First, remove the offers allocated to roles being removed.
+  // Rescind offers allocated to the roles that were removed.
+  const set<string> newRoles = protobuf::framework::getRoles(frameworkInfo);
   foreach (Offer* offer, utils::copy(framework->offers)) {
-    set<string> newRoles = protobuf::framework::getRoles(frameworkInfo);
-    if (newRoles.count(offer->allocation_info().role()) > 0) {
-      continue;
+    if (newRoles.count(offer->allocation_info().role()) == 0) {
+      rescindOffer(offer);
     }
-
-    allocator->recoverResources(
-        offer->framework_id(),
-        offer->slave_id(),
-        offer->resources(),
-        None());
-
-    removeOffer(offer, true); // Rescind!
   }
 
   framework->update(frameworkInfo);
@@ -8141,6 +8407,8 @@ void Master::updateSlave(UpdateSlaveMessage&& message)
 
   // Check if resource provider information changed.
   if (!updated && message.has_resource_providers()) {
+    hashset<ResourceProviderID> receivedResourceProviders;
+
     foreach (
         const UpdateSlaveMessage::ResourceProvider& receivedProvider,
         message.resource_providers().providers()) {
@@ -8149,6 +8417,8 @@ void Master::updateSlave(UpdateSlaveMessage&& message)
 
       const ResourceProviderID& resourceProviderId =
         receivedProvider.info().id();
+
+      receivedResourceProviders.insert(resourceProviderId);
 
       if (!slave->resourceProviders.contains(resourceProviderId)) {
         updated = true;
@@ -8180,12 +8450,21 @@ void Master::updateSlave(UpdateSlaveMessage&& message)
         }
       }
     }
+
+    if (slave->resourceProviders.keys() != receivedResourceProviders) {
+      updated = true;
+    }
   }
 
   if (!updated) {
     LOG(INFO) << "Ignoring update on agent " << *slave
               << " as it reports no changes";
 
+    // NOTE: This is necessary to catch draining agents with the
+    // RESOURCE_PROVIDER capability, since the master will not know about
+    // any pending operations until the first UpdateSlaveMessage has been
+    // sent after reregistration.
+    checkAndTransitionDrainingAgent(slave);
     return;
   }
 
@@ -8427,7 +8706,8 @@ void Master::updateSlave(UpdateSlaveMessage&& message)
                     oldOperation->latest_status().state()) &&
                 protobuf::isTerminalState(
                     newOperation->latest_status().state())) {
-              Operation* operation = CHECK_NOTNULL(slave->getOperation(uuid));
+              Operation* operation = slave->getOperation(uuid);
+              CHECK(operation != nullptr) << uuid;
 
               UpdateOperationStatusMessage update =
                 protobuf::createUpdateOperationStatusMessage(
@@ -8506,18 +8786,17 @@ void Master::updateSlave(UpdateSlaveMessage&& message)
   // Then rescind outstanding offers affected by the update.
   // NOTE: Need a copy of offers because the offers are removed inside the loop.
   foreach (Offer* offer, utils::copy(slave->offers)) {
-    bool rescind = false;
-
     const Resources& offered = offer->resources();
     // Since updates of the agent's oversubscribed resources are sent at regular
     // intervals, we only rescind offers containing revocable resources to
     // reduce churn.
     if (hasOversubscribed && !offered.revocable().empty()) {
-      LOG(INFO) << "Removing offer " << offer->id()
+      LOG(INFO) << "Rescinding offer " << offer->id()
                 << " with revocable resources " << offered << " on agent "
                 << *slave;
 
-      rescind = true;
+      rescindOffer(offer);
+      continue;
     }
 
     // Updates on resource providers can change the agent total
@@ -8530,27 +8809,19 @@ void Master::updateSlave(UpdateSlaveMessage&& message)
     if (message.has_resource_providers() &&
         !offeredResourceProviderResources.empty()) {
       LOG(INFO)
-        << "Removing offer " << offer->id()
+        << "Rescinding offer " << offer->id()
         << " with resources " << offered << " on agent " << *slave;
 
-      rescind = true;
+      rescindOffer(offer);
     }
-
-    if (!rescind) {
-      continue;
-    }
-
-    allocator->recoverResources(
-        offer->framework_id(),
-        offer->slave_id(),
-        offered,
-        None());
-
-    removeOffer(offer, true); // Rescind.
   }
 
   // NOTE: We don't need to rescind inverse offers here as they are unrelated to
   // oversubscription.
+
+  // Now that we have the agent's operations in master memory, we can check
+  // if the agent is drained and transition it appropriately if so.
+  checkAndTransitionDrainingAgent(slave);
 }
 
 
@@ -8587,13 +8858,10 @@ void Master::updateUnavailability(
         LOG(INFO) << "Removing unavailability of agent " << *slave;
       }
 
-      // Remove and rescind offers since we want to inform frameworks of the
+      // Rescind offers since we want to inform frameworks of the
       // unavailability change as soon as possible.
       foreach (Offer* offer, utils::copy(slave->offers)) {
-        allocator->recoverResources(
-            offer->framework_id(), slave->id, offer->resources(), None());
-
-        removeOffer(offer, true); // Rescind!
+        rescindOffer(offer);
       }
 
       // Remove and rescind inverse offers since the allocator will send new
@@ -8759,8 +9027,9 @@ void Master::updateOperationStatus(UpdateOperationStatusMessage&& update)
 
   const SlaveID& slaveId = update.slave_id();
 
-  // The status update for the operation might be for an
-  // operator API call, thus the framework ID here is optional.
+  // While currently only frameworks can initiate operations which request
+  // feedback, in some cases such as master/agent reconciliation, the framework
+  // ID will not be set in the update message.
   Option<FrameworkID> frameworkId = update.has_framework_id()
     ? update.framework_id()
     : Option<FrameworkID>::none();
@@ -8770,6 +9039,8 @@ void Master::updateOperationStatus(UpdateOperationStatusMessage&& update)
   // agent. Since the operation UUID is not known, there is nothing for the
   // master to do but forward the update to the framework and return.
   if (!update.has_operation_uuid()) {
+    CHECK_SOME(frameworkId);
+
     // Forward the status update to the framework.
     Framework* framework = getFramework(frameworkId.get());
 
@@ -8815,11 +9086,20 @@ void Master::updateOperationStatus(UpdateOperationStatusMessage&& update)
 
   Operation* operation = slave->getOperation(update.operation_uuid());
   if (operation == nullptr) {
-    // If the operation cannot be found, then this must be an update sent as a
-    // result of a framework-inititated reconciliation which was forwarded to
-    // the agent. Since the operation is not known to the master, there is
-    // nothing for the master to do but forward the update to the framework and
-    // return.
+    // If the operation cannot be found and no framework ID was set, then this
+    // must be a duplicate update as a result of master/agent reconciliation. In
+    // this case, a terminal reconciliation update has already been received by
+    // the master, so we simply return.
+    if (frameworkId.isNone()) {
+      return;
+    }
+
+    // If the operation cannot be found and a framework ID was set, then this
+    // must be an update sent as a result of a framework-inititated
+    // reconciliation which was forwarded to the agent and raced with an
+    // `UpdateSlaveMessage` which removed the operation. Since the operation is
+    // not known to the master, there is nothing for the master to do but
+    // forward the update to the framework and return.
     Framework* framework = getFramework(frameworkId.get());
 
     if (framework == nullptr || !framework->connected()) {
@@ -8846,7 +9126,7 @@ void Master::updateOperationStatus(UpdateOperationStatusMessage&& update)
     // `ReconcileOperationsMessage`, but they can be deduced from the operation
     // info kept on the master.
 
-    // Only operations done via the scheduler API can have an ID.
+    // Currently, only operations done via the scheduler API can have an ID.
     CHECK(operation->has_framework_id());
 
     frameworkId = operation->framework_id();
@@ -8866,10 +9146,13 @@ void Master::updateOperationStatus(UpdateOperationStatusMessage&& update)
   // Orphaned operations have no framework to send updates to.
   bool frameworkWillAcknowledge =
     operation->info().has_id() &&
+    frameworkId.isSome() &&
     !isCompletedFramework(frameworkId.get()) &&
     !slave->orphanedOperations.contains(operation->uuid());
 
   if (frameworkWillAcknowledge) {
+    CHECK_SOME(frameworkId);
+
     // Forward the status update to the framework.
     Framework* framework = getFramework(frameworkId.get());
 
@@ -8910,6 +9193,7 @@ void Master::updateOperationStatus(UpdateOperationStatusMessage&& update)
       // buffer may also be affected by this wait.
       if (operation->info().has_id() &&
           slave->orphanedOperations.contains(operation->uuid()) &&
+          frameworkId.isSome() &&
           !isCompletedFramework(frameworkId.get())) {
         if (slave->reregisteredTime.isSome() &&
             (Clock::now() - slave->reregisteredTime.get()) <
@@ -9243,6 +9527,8 @@ void Master::markGone(const SlaveID& slaveId, const TimeInfo& goneTime)
     }
 
     slaves.unreachable.erase(slaveId);
+    slaves.draining.erase(slaveId);
+    slaves.deactivated.erase(slaveId);
 
     // TODO(vinod): Consider moving these tasks into `completedTasks` by
     // transitioning them to a terminal state and sending status updates.
@@ -9788,7 +10074,9 @@ void Master::reconcileOperations(
       //     capability, then we forward the reconciliation request to the agent
       //     to respond based on whether or not this resource provider has been
       //     seen before. Otherwise, we respond with OPERATION_UNKNOWN.
-      Slave* slave = CHECK_NOTNULL(slaves.registered.get(slaveId.get()));
+      Slave* slave = slaves.registered.get(slaveId.get());
+      CHECK(slave != nullptr) << slaveId.get();
+
       if (resourceProviderId.isSome() &&
           !slave->resourceProviders.contains(resourceProviderId.get()) &&
           slave->capabilities.agentOperationFeedback) {
@@ -10574,6 +10862,13 @@ void Master::recoverFramework(
 
   Framework* framework = new Framework(this, flags, info);
 
+  // Send a `FRAMEWORK_ADDED` event to subscribers before adding recovered tasks
+  // so the framework ID referred by any succeeding `TASK_ADDED` event will be
+  // known to subscribers.
+  if (!subscribers.subscribed.empty()) {
+    subscribers.send(protobuf::master::event::createFrameworkAdded(*framework));
+  }
+
   // Add active operations, tasks, and executors to the framework.
   foreachvalue (Slave* slave, slaves.registered) {
     if (slave->tasks.contains(framework->id())) {
@@ -10665,7 +10960,7 @@ void Master::recoverFramework(
 }
 
 
-Try<Nothing> Master::activateRecoveredFramework(
+void Master::activateRecoveredFramework(
     Framework* framework,
     const FrameworkInfo& frameworkInfo,
     const Option<UPID>& pid,
@@ -10742,8 +11037,6 @@ Try<Nothing> Master::activateRecoveredFramework(
     // Start the heartbeat after sending SUBSCRIBED event.
     framework->heartbeat();
   }
-
-  return Nothing();
 }
 
 
@@ -10828,12 +11121,9 @@ void Master::failoverFramework(Framework* framework, const UPID& newPid)
 
 void Master::_failoverFramework(Framework* framework)
 {
-  // Remove the framework's offers (if they weren't removed before).
+  // Discard the framework's offers, if they weren't removed before.
   foreach (Offer* offer, utils::copy(framework->offers)) {
-    allocator->recoverResources(
-        offer->framework_id(), offer->slave_id(), offer->resources(), None());
-
-    removeOffer(offer);
+    discardOffer(offer);
   }
 
   // Also remove the inverse offers.
@@ -11013,7 +11303,7 @@ void Master::removeFramework(Framework* framework)
         << "External resource provider is not supported yet";
 
       Slave* slave = slaves.registered.get(operation->slave_id());
-      CHECK_NOTNULL(slave);
+      CHECK(slave != nullptr) << operation->slave_id();
 
       slave->markOperationAsOrphan(operation);
 
@@ -11257,7 +11547,10 @@ void Master::addSlave(
       slave->usedResources);
 
   if (!subscribers.subscribed.empty()) {
-    subscribers.send(protobuf::master::event::createAgentAdded(*slave));
+    subscribers.send(protobuf::master::event::createAgentAdded(
+        *slave,
+        slaves.draining.get(slave->id),
+        slaves.deactivated.contains(slave->id)));
   }
 }
 
@@ -11347,12 +11640,6 @@ void Master::_removeSlave(
 
   // We want to remove the slave first, to avoid the allocator
   // re-allocating the recovered resources.
-  //
-  // NOTE: Removing the slave is not sufficient for recovering the
-  // resources in the allocator, because the "Sorters" are updated
-  // only within recoverResources() (see MESOS-621). The calls to
-  // recoverResources() below are therefore required, even though
-  // the slave is already removed.
   allocator->removeSlave(slave->id);
 
   // Transition the tasks to lost and remove them.
@@ -11395,13 +11682,7 @@ void Master::_removeSlave(
   }
 
   foreach (Offer* offer, utils::copy(slave->offers)) {
-    // TODO(vinod): We don't need to call 'Allocator::recoverResources'
-    // once MESOS-621 is fixed.
-    allocator->recoverResources(
-        offer->framework_id(), slave->id, offer->resources(), None());
-
-    // Remove and rescind offers.
-    removeOffer(offer, true); // Rescind!
+    rescindOffer(offer);
   }
 
   // Remove inverse offers because sending them for a slave that is
@@ -11456,6 +11737,13 @@ void Master::_removeSlave(
   CHECK(machines[slave->machineId].slaves.contains(slave->id));
   machines[slave->machineId].slaves.erase(slave->id);
 
+  // Remove any draining information about the agent.
+  // NOTE: This should not be mirrored by `__removeSlave` because that
+  // method handles both unreachable and gone agents. Unreachable agents
+  // will retain their draining information, but gone agents will not.
+  slaves.draining.erase(slave->id);
+  slaves.deactivated.erase(slave->id);
+
   // Kill the slave observer.
   terminate(slave->observer);
   wait(slave->observer);
@@ -11480,12 +11768,6 @@ void Master::__removeSlave(
 {
   // We want to remove the slave first, to avoid the allocator
   // re-allocating the recovered resources.
-  //
-  // NOTE: Removing the slave is not sufficient for recovering the
-  // resources in the allocator, because the "Sorters" are updated
-  // only within recoverResources() (see MESOS-621). The calls to
-  // recoverResources() below are therefore required, even though
-  // the slave is already removed.
   allocator->removeSlave(slave->id);
 
   // Transition tasks to TASK_UNREACHABLE/TASK_GONE_BY_OPERATOR/TASK_LOST
@@ -11552,13 +11834,7 @@ void Master::__removeSlave(
   }
 
   foreach (Offer* offer, utils::copy(slave->offers)) {
-    // TODO(vinod): We don't need to call 'Allocator::recoverResources'
-    // once MESOS-621 is fixed.
-    allocator->recoverResources(
-        offer->framework_id(), slave->id, offer->resources(), None());
-
-    // Remove and rescind offers.
-    removeOffer(offer, true); // Rescind!
+    rescindOffer(offer);
   }
 
   // Remove inverse offers because sending them for a slave that is
@@ -11740,7 +12016,7 @@ void Master::updateTask(Task* task, const StatusUpdate& update)
 
     // The slave owns the Task object and cannot be nullptr.
     Slave* slave = slaves.registered.get(task->slave_id());
-    CHECK_NOTNULL(slave);
+    CHECK(slave != nullptr) << task->slave_id();
 
     slave->recoverResources(task);
 
@@ -11787,7 +12063,7 @@ void Master::removeTask(Task* task, bool unreachable)
 
   // The slave owns the Task object and cannot be nullptr.
   Slave* slave = slaves.registered.get(task->slave_id());
-  CHECK_NOTNULL(slave);
+  CHECK(slave != nullptr) << task->slave_id();
 
   // Note that we explicitly convert from protobuf to `Resources` here
   // and then use the result below to avoid performance penalty for multiple
@@ -11983,7 +12259,7 @@ void Master::updateOperation(
   // TODO(jieyu): Revisit this once we introduce support for external
   // resource provider.
   Slave* slave = slaves.registered.get(operation->slave_id());
-  CHECK_NOTNULL(slave);
+  CHECK(slave != nullptr) << operation->slave_id();
 
   // Orphaned operations are handled differently, because the allocator
   // has no knowledge of resources consumed by these operations;
@@ -12145,7 +12421,7 @@ void Master::removeOperation(Operation* operation)
     << "External resource provider is not supported yet";
 
   Slave* slave = slaves.registered.get(operation->slave_id());
-  CHECK_NOTNULL(slave);
+  CHECK(slave != nullptr) << operation->slave_id();
 
   slave->removeOperation(operation);
 
@@ -12218,7 +12494,7 @@ void Master::_apply(
 
     const UUID resourceVersion = resourceProviderId.isNone()
       ? slave->resourceVersion.get()
-      : slave->resourceProviders.get(resourceProviderId.get())->resourceVersion;
+      : slave->resourceProviders.at(resourceProviderId.get()).resourceVersion;
 
     Operation* operation = new Operation(protobuf::createOperation(
         operationInfo,
@@ -12332,23 +12608,48 @@ void Master::offerTimeout(const OfferID& offerId)
 {
   Offer* offer = getOffer(offerId);
   if (offer != nullptr) {
-    allocator->recoverResources(
-        offer->framework_id(), offer->slave_id(), offer->resources(), None());
-    removeOffer(offer, true);
+    rescindOffer(offer);
   }
 }
 
 
-// TODO(vinod): Instead of 'removeOffer()', consider implementing
-// 'useOffer()', 'discardOffer()' and 'rescindOffer()' for clarity.
-void Master::removeOffer(Offer* offer, bool rescind)
+void Master::rescindOffer(Offer* offer, const Option<Filters>& filters)
 {
-  // Remove from framework.
   Framework* framework = getFramework(offer->framework_id());
   CHECK(framework != nullptr)
     << "Unknown framework " << offer->framework_id()
     << " in the offer " << offer->id();
 
+  RescindResourceOfferMessage message;
+  message.mutable_offer_id()->MergeFrom(offer->id());
+
+  framework->metrics.offers_rescinded++;
+  framework->send(message);
+
+  allocator->recoverResources(
+      offer->framework_id(), offer->slave_id(), offer->resources(), filters);
+
+  _removeOffer(framework, offer);
+}
+
+
+void Master::discardOffer(Offer* offer, const Option<Filters>& filters)
+{
+  Framework* framework = getFramework(offer->framework_id());
+  CHECK(framework != nullptr)
+    << "Unknown framework " << offer->framework_id()
+    << " in the offer " << offer->id();
+
+  allocator->recoverResources(
+      offer->framework_id(), offer->slave_id(), offer->resources(), filters);
+
+  _removeOffer(framework, offer);
+}
+
+
+void Master::_removeOffer(Framework* framework, Offer* offer)
+{
+  CHECK_EQ(framework->id(), offer->framework_id());
   framework->removeOffer(offer);
 
   // Remove from slave.
@@ -12359,13 +12660,6 @@ void Master::removeOffer(Offer* offer, bool rescind)
     << " in the offer " << offer->id();
 
   slave->removeOffer(offer);
-
-  if (rescind) {
-    RescindResourceOfferMessage message;
-    message.mutable_offer_id()->MergeFrom(offer->id());
-    framework->metrics.offers_rescinded++;
-    framework->send(message);
-  }
 
   // Remove and cancel offer removal timers. Canceling the Timers is
   // only done to avoid having too many active Timers in libprocess.
@@ -12850,9 +13144,8 @@ void Master::Subscribers::send(
   Shared<Task> sharedTask(task.isSome() ? new Task(task.get()) : nullptr);
 
   foreachvalue (const Owned<Subscriber>& subscriber, subscribed) {
-    ObjectApprovers::create(
+    subscriber->getApprovers(
         master->authorizer,
-        subscriber->principal,
         {VIEW_ROLE, VIEW_FRAMEWORK, VIEW_TASK, VIEW_EXECUTOR})
       .then(defer(
           master->self(),
@@ -12866,6 +13159,18 @@ void Master::Subscribers::send(
             return Nothing();
           }));
   }
+}
+
+
+Future<Owned<ObjectApprovers>> Master::Subscribers::Subscriber::getApprovers(
+    const Option<Authorizer*>& authorizer,
+    std::initializer_list<authorization::Action> actions)
+{
+  Future<Owned<ObjectApprovers>> approvers =
+    ObjectApprovers::create(authorizer, principal, actions);
+
+  return approversSequence.add<Owned<ObjectApprovers>>(
+      [approvers] { return approvers; });
 }
 
 
@@ -13424,7 +13729,7 @@ bool Slave::hasExecutor(const FrameworkID& frameworkId,
                         const ExecutorID& executorId) const
 {
   return executors.contains(frameworkId) &&
-    executors.get(frameworkId)->contains(executorId);
+         executors.at(frameworkId).contains(executorId);
 }
 
 

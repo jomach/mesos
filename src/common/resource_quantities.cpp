@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include <mesos/resource_quantities.hpp>
+#include <mesos/resources.hpp>
 #include <mesos/values.hpp>
 
 #include <stout/check.hpp>
@@ -25,15 +27,12 @@
 #include <stout/foreach.hpp>
 #include <stout/numify.hpp>
 
-#include "common/resource_quantities.hpp"
-
 using std::ostream;
 using std::pair;
 using std::string;
 using std::vector;
 
 namespace mesos {
-namespace internal {
 
 // This function tries to be consistent with `Resources::fromSimpleString()`.
 // We trim the whitespace around the pair and in the number but whitespace in
@@ -48,7 +47,7 @@ Try<ResourceQuantities> ResourceQuantities::fromString(const string& text)
       return Error("Failed to parse '" + token + "': missing or extra ':'");
     }
 
-    Try<Value> value = values::parse(pair[1]);
+    Try<Value> value = internal::values::parse(pair[1]);
     if (value.isError()) {
       return Error(
           "Failed to parse '" + pair[1] + "' to quantity: " + value.error());
@@ -89,6 +88,19 @@ ResourceQuantities ResourceQuantities::fromScalarResources(
 }
 
 
+ResourceQuantities ResourceQuantities::fromScalarResource(
+  const Resource& resource)
+{
+  ResourceQuantities result;
+
+  CHECK_EQ(Value::SCALAR, resource.type()) << " Resource: " << resource;
+
+  result.add(resource.name(), resource.scalar());
+
+  return result;
+}
+
+
 ResourceQuantities ResourceQuantities::fromResources(const Resources& resources)
 {
   ResourceQuantities result;
@@ -119,12 +131,7 @@ ResourceQuantities ResourceQuantities::fromResources(const Resources& resources)
 }
 
 
-ResourceQuantities::ResourceQuantities()
-{
-  // Pre-reserve space for first-class resources.
-  // [cpus, disk, gpus, mem, ports]
-  quantities.reserve(5u);
-}
+ResourceQuantities::ResourceQuantities() {}
 
 
 ResourceQuantities::ResourceQuantities(
@@ -140,17 +147,15 @@ ResourceQuantities::ResourceQuantities(
 
 ResourceQuantities::const_iterator ResourceQuantities::begin()
 {
-  return static_cast<const std::vector<std::pair<std::string, Value::Scalar>>&>(
-             quantities)
-    .begin();
+  const auto& self = *this;
+  return self.begin();
 }
 
 
 ResourceQuantities::const_iterator ResourceQuantities::end()
 {
-  return static_cast<const std::vector<std::pair<std::string, Value::Scalar>>&>(
-             quantities)
-    .end();
+  const auto& self = *this;
+  return self.end();
 }
 
 
@@ -350,28 +355,6 @@ void ResourceQuantities::add(const string& name, const double value)
 }
 
 
-ostream& operator<<(
-    ostream& stream,
-    const ResourceQuantities& quantities)
-{
-  if (quantities.begin() == quantities.end()) {
-    stream << "{}";
-    return stream;
-  }
-
-  auto it = quantities.begin();
-
-  while (it != quantities.end()) {
-    stream << it->first << ':' << it->second;
-    if (++it != quantities.end()) {
-      stream << "; ";
-    }
-  }
-
-  return stream;
-}
-
-
 // This function tries to be consistent with `Resources::fromSimpleString()`.
 // We trim the whitespace around the pair and in the number but whitespace in
 // "c p us:10" are preserved and will be parsed to {"c p us", 10}.
@@ -385,7 +368,7 @@ Try<ResourceLimits> ResourceLimits::fromString(const string& text)
       return Error("Failed to parse '" + token + "': missing or extra ':'");
     }
 
-    Try<Value> value = values::parse(pair[1]);
+    Try<Value> value = internal::values::parse(pair[1]);
     if (value.isError()) {
       return Error(
           "Failed to parse '" + pair[1] + "' to limit: " + value.error());
@@ -417,12 +400,7 @@ Try<ResourceLimits> ResourceLimits::fromString(const string& text)
 }
 
 
-ResourceLimits::ResourceLimits()
-{
-  // Pre-reserve space for first-class resources.
-  // [cpus, disk, gpus, mem, ports]
-  limits.reserve(5u);
-}
+ResourceLimits::ResourceLimits() {}
 
 
 ResourceLimits::ResourceLimits(
@@ -438,17 +416,15 @@ ResourceLimits::ResourceLimits(
 
 ResourceLimits::const_iterator ResourceLimits::begin()
 {
-  return static_cast<const std::vector<std::pair<std::string, Value::Scalar>>&>(
-           limits)
-    .begin();
+  const auto& self = *this;
+  return self.begin();
 }
 
 
 ResourceLimits::const_iterator ResourceLimits::end()
 {
-  return static_cast<const std::vector<std::pair<std::string, Value::Scalar>>&>(
-           limits)
-    .end();
+  const auto& self = *this;
+  return self.end();
 }
 
 
@@ -505,6 +481,19 @@ bool ResourceLimits::contains(const ResourceLimits& right) const
 }
 
 
+bool ResourceLimits::operator==(const ResourceLimits& that) const
+{
+  return limits == that.limits;
+}
+
+
+bool ResourceLimits::operator!=(const ResourceLimits& that) const
+{
+  return limits != that.limits;
+}
+
+
+// TODO(mzhu): Given the friendship, optimize this to be one pass.
 bool ResourceLimits::contains(const ResourceQuantities& quantities) const
 {
   foreachpair (const string& name, const Value::Scalar& quantity, quantities) {
@@ -516,6 +505,49 @@ bool ResourceLimits::contains(const ResourceQuantities& quantities) const
   }
 
   return true;
+}
+
+
+ResourceLimits& ResourceLimits::operator-=(const ResourceQuantities& quantities)
+{
+  size_t limitsIndex = 0u;
+  size_t quantitiesIndex = 0u;
+
+  // Since both limits and quantities are sorted in alphabetical order, we can
+  // walk them at the same time.
+  while (limitsIndex < size() && quantitiesIndex < quantities.size()) {
+    pair<string, Value::Scalar>& limit = limits.at(limitsIndex);
+    const pair<string, Value::Scalar>& quantity =
+      quantities.quantities.at(quantitiesIndex);
+
+    if (limit.first < quantity.first) {
+      // Item exists in limits but not in quantities i.e.
+      // finite limit minus zero quantity.
+      ++limitsIndex;
+    } else if (limit.first > quantity.first) {
+      // Item exists in quantities but not in limits i.e.
+      // infinite limit minus finite quantity.
+      ++quantitiesIndex;
+    } else {
+      // Item exists in both limits and quantities i.e.
+      // finite limits minus finite quantity.
+      limit.second = std::max(limit.second - quantity.second,
+                              Value::Scalar());
+      ++limitsIndex;
+      ++quantitiesIndex;
+    }
+  }
+
+  return *this;
+}
+
+
+ResourceLimits ResourceLimits::operator-(
+    const ResourceQuantities& quantities) const
+{
+  ResourceLimits result = *this;
+  result -= quantities;
+  return result;
 }
 
 
@@ -542,5 +574,48 @@ void ResourceLimits::set(
 }
 
 
-} // namespace internal {
+ostream& operator<<(
+    ostream& stream,
+    const ResourceQuantities& quantities)
+{
+  if (quantities.begin() == quantities.end()) {
+    stream << "{}";
+    return stream;
+  }
+
+  auto it = quantities.begin();
+
+  while (it != quantities.end()) {
+    stream << it->first << ':' << it->second;
+    if (++it != quantities.end()) {
+      stream << "; ";
+    }
+  }
+
+  return stream;
+}
+
+
+ostream& operator<<(
+    ostream& stream,
+    const ResourceLimits& limits)
+{
+  if (limits.begin() == limits.end()) {
+    stream << "{}";
+    return stream;
+  }
+
+  auto it = limits.begin();
+
+  while (it != limits.end()) {
+    stream << it->first << ':' << it->second;
+    if (++it != limits.end()) {
+      stream << "; ";
+    }
+  }
+
+  return stream;
+}
+
+
 } // namespace mesos {

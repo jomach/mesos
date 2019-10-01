@@ -23,11 +23,13 @@
 #include <string>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
 #include <boost/iterator/indirect_iterator.hpp>
 
 #include <google/protobuf/repeated_field.h>
 
 #include <mesos/mesos.hpp>
+#include <mesos/resource_quantities.hpp>
 #include <mesos/type_utils.hpp>
 #include <mesos/values.hpp>
 
@@ -58,8 +60,6 @@ namespace mesos {
 
 // Forward declaration.
 class ResourceConversion;
-
-namespace internal { class ResourceQuantities; }
 
 
 // Helper functions.
@@ -349,6 +349,16 @@ public:
   // Tests if the given Resource object is shared.
   static bool isShared(const Resource& resource);
 
+  // Returns true if the resource is allocated to the role subtree
+  // (i.e. either to the role itself or to its decedents).
+  static bool isAllocatedToRoleSubtree(
+      const Resource& resource, const std::string& role);
+
+  // Returns true if the resource is reserved to the role subtree
+  // (i.e. either to the role itself or to its decedents).
+  static bool isReservedToRoleSubtree(
+      const Resource& resource, const std::string& role);
+
   // Tests if the given Resource object has refined reservations.
   static bool hasRefinedReservations(const Resource& resource);
 
@@ -446,8 +456,7 @@ public:
   // quantities are the number of different instances in the range or set.
   // For example, "range:[1-5]" has a quantity of 5 and "set:{a,b}" has a
   // quantity of 2.
-  bool contains(
-      const mesos::internal::ResourceQuantities& quantities) const;
+  bool contains(const ResourceQuantities& quantities) const;
 
   // Count the Resource objects that match the specified value.
   //
@@ -481,6 +490,14 @@ public:
   // Returns resources allocatable to role. See `isAllocatableTo` for the
   // definition of 'allocatableTo'.
   Resources allocatableTo(const std::string& role) const;
+
+  // Returns resources that are allocated to the role subtree
+  // (i.e. either to the role itself or to its decedents).
+  Resources allocatedToRoleSubtree(const std::string& role) const;
+
+  // Returns resources that are reserved to the role subtree
+  // (i.e. either to the role itself or to its decedents).
+  Resources reservedToRoleSubtree(const std::string& role) const;
 
   // Returns the unreserved resources.
   Resources unreserved() const;
@@ -614,21 +631,19 @@ public:
   // iterators to prevent mutable access to the `Resource` objects.
 
   typedef boost::indirect_iterator<
-      std::vector<Resource_Unsafe>::const_iterator>
+      boost::container::small_vector_base<Resource_Unsafe>::const_iterator>
     const_iterator;
 
   const_iterator begin()
   {
-    return static_cast<const std::vector<Resource_Unsafe>&>(
-               resourcesNoMutationWithoutExclusiveOwnership)
-      .begin();
+    const auto& self = *this;
+    return self.begin();
   }
 
   const_iterator end()
   {
-    return static_cast<const std::vector<Resource_Unsafe>&>(
-               resourcesNoMutationWithoutExclusiveOwnership)
-      .end();
+    const auto& self = *this;
+    return self.end();
   }
 
   const_iterator begin() const
@@ -738,7 +753,12 @@ private:
   //
   // TODO(mzhu): Consider using `boost::intrusive_ptr` for
   // possibly better performance.
-  std::vector<Resource_Unsafe> resourcesNoMutationWithoutExclusiveOwnership;
+  //
+  // We chose a size of 15 based on the fact that we have five first class
+  // resources (cpu, mem, disk, gpu and port). And 15 would allow one set of
+  // unreserved resources and two sets of reservations.
+  boost::container::small_vector<Resource_Unsafe, 15>
+    resourcesNoMutationWithoutExclusiveOwnership;
 };
 
 
@@ -803,6 +823,15 @@ hashmap<Key, Resources> operator+(
   result += right;
   return result;
 }
+
+
+// Tests if `right` is contained in `left`, note that most
+// callers should just make use of `Resources::contains(...)`.
+// However, if dealing only with singular `Resource` objects,
+// this has lower overhead.
+//
+// NOTE: `left` and `right` must be valid resource objects.
+bool contains(const Resource& left, const Resource& right);
 
 
 /**

@@ -70,8 +70,10 @@
 
 #include "slave/containerizer/mesos/constants.hpp"
 #include "slave/containerizer/mesos/containerizer.hpp"
+#include "slave/containerizer/mesos/isolator_tracker.hpp"
 #include "slave/containerizer/mesos/launch.hpp"
 #include "slave/containerizer/mesos/launcher.hpp"
+#include "slave/containerizer/mesos/launcher_tracker.hpp"
 #include "slave/containerizer/mesos/paths.hpp"
 #include "slave/containerizer/mesos/utils.hpp"
 
@@ -106,6 +108,7 @@
 #include "slave/containerizer/mesos/isolators/gpu/nvidia.hpp"
 #include "slave/containerizer/mesos/isolators/linux/capabilities.hpp"
 #include "slave/containerizer/mesos/isolators/linux/devices.hpp"
+#include "slave/containerizer/mesos/isolators/linux/nnp.hpp"
 #include "slave/containerizer/mesos/isolators/namespaces/ipc.hpp"
 #include "slave/containerizer/mesos/isolators/namespaces/pid.hpp"
 #include "slave/containerizer/mesos/isolators/network/cni/cni.hpp"
@@ -177,7 +180,8 @@ Try<MesosContainerizer*> MesosContainerizer::create(
     GarbageCollector* gc,
     SecretResolver* secretResolver,
     const Option<NvidiaComponents>& nvidia,
-    VolumeGidManager* volumeGidManager)
+    VolumeGidManager* volumeGidManager,
+    PendingFutureTracker* futureTracker)
 {
   Try<hashset<string>> isolations = [&flags]() -> Try<hashset<string>> {
     const vector<string> tokens(strings::tokenize(flags.isolation, ","));
@@ -314,7 +318,7 @@ Try<MesosContainerizer*> MesosContainerizer::create(
   LOG(INFO) << "Using isolation " << stringify(isolations.get());
 
   // Create the launcher for the MesosContainerizer.
-  Try<Launcher*> launcher = [&flags]() -> Try<Launcher*> {
+  Try<Launcher*> _launcher = [&flags]() -> Try<Launcher*> {
 #ifdef __linux__
     if (flags.launcher == "linux") {
       return LinuxLauncher::create(flags);
@@ -338,8 +342,14 @@ Try<MesosContainerizer*> MesosContainerizer::create(
 #endif // __linux__
   }();
 
-  if (launcher.isError()) {
-    return Error("Failed to create launcher: " + launcher.error());
+  if (_launcher.isError()) {
+    return Error("Failed to create launcher: " + _launcher.error());
+  }
+
+  Owned<Launcher> launcher = Owned<Launcher>(_launcher.get());
+
+  if (futureTracker != nullptr) {
+    launcher = Owned<Launcher>(new LauncherTracker(launcher, futureTracker));
   }
 
   Try<Owned<Provisioner>> _provisioner =
@@ -407,7 +417,6 @@ Try<MesosContainerizer*> MesosContainerizer::create(
 #endif // __WINDOWS__
 
 #ifdef __WINDOWS__
-    {"docker/runtime", &DockerRuntimeIsolatorProcess::create},
     {"windows/cpu", &WindowsCpuIsolatorProcess::create},
     {"windows/mem", &WindowsMemIsolatorProcess::create},
 #endif // __WINDOWS__
@@ -430,6 +439,7 @@ Try<MesosContainerizer*> MesosContainerizer::create(
 
     {"linux/devices", &LinuxDevicesIsolatorProcess::create},
     {"linux/capabilities", &LinuxCapabilitiesIsolatorProcess::create},
+    {"linux/nnp", &LinuxNNPIsolatorProcess::create},
 
     {"namespaces/ipc", &NamespacesIPCIsolatorProcess::create},
     {"namespaces/pid", &NamespacesPidIsolatorProcess::create},
@@ -538,26 +548,40 @@ Try<MesosContainerizer*> MesosContainerizer::create(
       cgroupsIsolatorCreated = true;
     }
 
-    Try<Isolator*> isolator = creator.second(flags);
-    if (isolator.isError()) {
+    Try<Isolator*> _isolator = creator.second(flags);
+    if (_isolator.isError()) {
       return Error("Failed to create isolator '" + creator.first + "': " +
-                   isolator.error());
+                   _isolator.error());
     }
 
-    isolators.push_back(Owned<Isolator>(isolator.get()));
+    Owned<Isolator> isolator(_isolator.get());
+
+    if (futureTracker != nullptr) {
+      isolator = Owned<Isolator>(
+          new IsolatorTracker(isolator, creator.first, futureTracker));
+    }
+
+    isolators.push_back(isolator);
   }
 
   // Next, apply any custom isolators in the order given by the flags.
   foreach (const string& name, strings::tokenize(flags.isolation, ",")) {
     if (ModuleManager::contains<Isolator>(name)) {
-      Try<Isolator*> isolator = ModuleManager::create<Isolator>(name);
+      Try<Isolator*> _isolator = ModuleManager::create<Isolator>(name);
 
-      if (isolator.isError()) {
+      if (_isolator.isError()) {
         return Error("Failed to create isolator '" + name + "': " +
-                    isolator.error());
+                    _isolator.error());
       }
 
-      isolators.push_back(Owned<Isolator>(isolator.get()));
+      Owned<Isolator> isolator(_isolator.get());
+
+      if (futureTracker != nullptr) {
+        isolator = Owned<Isolator>(
+            new IsolatorTracker(isolator, name, futureTracker));
+      }
+
+      isolators.push_back(isolator);
       continue;
     }
 
@@ -582,7 +606,7 @@ Try<MesosContainerizer*> MesosContainerizer::create(
       local,
       fetcher,
       gc,
-      Owned<Launcher>(launcher.get()),
+      launcher,
       provisioner,
       isolators,
       volumeGidManager);
@@ -870,6 +894,7 @@ Future<Nothing> MesosContainerizerProcess::recover(
         ContainerState executorRunState =
           protobuf::slave::createContainerState(
               executorInfo,
+              None(),
               run->id.get(),
               run->forkedPid.get(),
               directory);
@@ -880,7 +905,7 @@ Future<Nothing> MesosContainerizerProcess::recover(
   }
 
   // Recover the containers from 'SlaveState'.
-  foreach (const ContainerState& state, recoverable) {
+  foreach (ContainerState& state, recoverable) {
     const ContainerID& containerId = state.container_id();
 
     // Contruct the structure for containers from the 'SlaveState'
@@ -907,6 +932,10 @@ Future<Nothing> MesosContainerizerProcess::recover(
 
     if (config.isSome()) {
       container->config = config.get();
+
+      // Copy the ephemeral volume paths to the ContainerState, since this
+      // information is otherwise only available to the prepare() callback.
+      *state.mutable_ephemeral_volumes() = config->ephemeral_volumes();
     } else {
       VLOG(1) << "No config is recovered for container " << containerId
               << ", this means image pruning will be disabled.";
@@ -1066,9 +1095,18 @@ Future<Nothing> MesosContainerizerProcess::recover(
       ContainerState state =
         protobuf::slave::createContainerState(
             None(),
+            config.isSome() && config->has_container_info() ?
+                Option<ContainerInfo>(config->container_info()) :
+                Option<ContainerInfo>::none(),
             containerId,
             container->pid.get(),
             container->directory.get());
+
+      if (config.isSome()) {
+        // Copy the ephemeral volume paths to the ContainerState, since this
+        // information is otherwise only available to the prepare() callback.
+        *state.mutable_ephemeral_volumes() = config->ephemeral_volumes();
+      }
 
       recoverable.push_back(state);
       continue;
@@ -1410,7 +1448,6 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::launch(
   }
 
   Owned<Container> container(new Container());
-  container->state = PROVISIONING;
   container->config = containerConfig;
   container->resources = containerConfig.resources();
   container->directory = containerConfig.directory();
@@ -1423,6 +1460,7 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::launch(
   }
 
   containers_.put(containerId, container);
+  transition(containerId, PROVISIONING);
 
   Future<Nothing> _prepare;
 
@@ -1492,6 +1530,12 @@ Future<Nothing> MesosContainerizerProcess::prepare(
 
   if (provisionInfo.isSome()) {
     container->config->set_rootfs(provisionInfo->rootfs);
+
+    if (provisionInfo->ephemeralVolumes.isSome()) {
+      foreach (const Path& path, provisionInfo->ephemeralVolumes.get()) {
+        container->config->add_ephemeral_volumes(path);
+      }
+    }
 
     if (provisionInfo->dockerManifest.isSome() &&
         provisionInfo->appcManifest.isSome()) {
@@ -1837,25 +1881,15 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
   if (container->containerClass() == ContainerClass::DEFAULT) {
     // TODO(jieyu): Consider moving this to filesystem isolator.
     //
-    // NOTE: For the command executor case, although it uses the host filesystem
-    // for itself, we still set `MESOS_SANDBOX` according to the root filesystem
-    // of the task (if specified). Command executor itself does not use this
-    // environment variable. For nested container which does not have its own
-    // rootfs, if the `filesystem/linux` isolator is enabled, we will also set
-    // `MESOS_SANDBOX` to `flags.sandbox_directory` since in `prepare` method
-    // of the `filesystem/linux` isolator we bind mount such nested container's
-    // sandbox to `flags.sandbox_directory`. Since such bind mount is only done
-    // by the `filesystem/linux` isolator, if another filesystem isolator (e.g.,
-    // `filesystem/posix`) is enabled instead, nested container may still have
-    // no permission to access its sandbox via `MESOS_SANDBOX`.
+    // NOTE: For the command executor case, although it uses the host
+    // filesystem for itself, we still set 'MESOS_SANDBOX' according to
+    // the root filesystem of the task (if specified). Command executor
+    // itself does not use this environment variable.
     Environment::Variable* variable = containerEnvironment.add_variables();
     variable->set_name("MESOS_SANDBOX");
-    variable->set_value(
-        (container->config->has_rootfs() ||
-         (strings::contains(flags.isolation, "filesystem/linux") &&
-          containerId.has_parent()))
-          ? flags.sandbox_directory
-          : container->config->directory());
+    variable->set_value(container->config->has_rootfs()
+      ? flags.sandbox_directory
+      : container->config->directory());
   }
 
   // `launchInfo.environment` contains the environment returned by
@@ -3283,13 +3317,16 @@ void MesosContainerizerProcess::transition(
 {
   CHECK(containers_.contains(containerId));
 
+  Time now = Clock::now();
   const Owned<Container>& container = containers_.at(containerId);
 
   LOG_BASED_ON_CLASS(container->containerClass())
     << "Transitioning the state of container " << containerId << " from "
-    << container->state << " to " << state;
+    << container->state << " to " << state
+    << " after " << (now - container->lastStateTransition);
 
   container->state = state;
+  container->lastStateTransition = now;
 }
 
 
@@ -3329,6 +3366,8 @@ std::ostream& operator<<(
     const MesosContainerizerProcess::State& state)
 {
   switch (state) {
+    case MesosContainerizerProcess::STARTING:
+      return stream << "STARTING";
     case MesosContainerizerProcess::PROVISIONING:
       return stream << "PROVISIONING";
     case MesosContainerizerProcess::PREPARING:
@@ -3341,9 +3380,9 @@ std::ostream& operator<<(
       return stream << "RUNNING";
     case MesosContainerizerProcess::DESTROYING:
       return stream << "DESTROYING";
-    default:
-      UNREACHABLE();
   }
+
+  UNREACHABLE();
 };
 
 } // namespace slave {

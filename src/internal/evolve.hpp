@@ -62,7 +62,9 @@ namespace internal {
 // Helpers for evolving types between versions. Please add as necessary!
 v1::AgentID evolve(const SlaveID& slaveId);
 v1::AgentInfo evolve(const SlaveInfo& slaveInfo);
+v1::ContainerInfo evolve(const ContainerInfo& containerInfo);
 v1::DomainInfo evolve(const DomainInfo& domainInfo);
+v1::DrainInfo evolve(const DrainInfo& drainInfo);
 v1::ExecutorID evolve(const ExecutorID& executorId);
 v1::ExecutorInfo evolve(const ExecutorInfo& executorInfo);
 v1::FileInfo evolve(const FileInfo& fileInfo);

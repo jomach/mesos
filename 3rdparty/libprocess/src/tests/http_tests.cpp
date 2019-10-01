@@ -40,6 +40,7 @@
 #include <process/socket.hpp>
 
 #include <process/ssl/gtest.hpp>
+#include <process/ssl/tls_config.hpp>
 
 #include <stout/base64.hpp>
 #include <stout/gtest.hpp>
@@ -260,7 +261,20 @@ TEST_P(HTTPTest, Endpoints)
 
     inet::Socket socket = create.get();
 
-    AWAIT_READY(socket.connect(http.process->self().address));
+    Future<Nothing> connected = [&]() {
+      switch(socket.kind()) {
+        case network::internal::SocketImpl::Kind::POLL:
+          return socket.connect(http.process->self().address);
+#ifdef USE_SSL_SOCKET
+        case network::internal::SocketImpl::Kind::SSL:
+          return socket.connect(
+              http.process->self().address,
+              network::openssl::create_tls_client_config(None()));
+#endif
+      }
+      UNREACHABLE();
+    }();
+    AWAIT_READY(connected);
 
     std::ostringstream out;
     out << "GET /" << http.process->self().id << "/body"
@@ -1600,11 +1614,9 @@ TEST_P(HTTPTest, CaseInsensitiveHeaders)
 
 TEST_P(HTTPTest, WWWAuthenticateHeader)
 {
-  http::Headers headers;
-  headers["Www-Authenticate"] = "Basic realm=\"basic-realm\"";
-
   Result<http::header::WWWAuthenticate> header =
-    headers.get<http::header::WWWAuthenticate>();
+    http::Headers({{"Www-Authenticate", "Basic realm=\"basic-realm\""}})
+      .get<http::header::WWWAuthenticate>();
 
   ASSERT_SOME(header);
 
@@ -1612,17 +1624,14 @@ TEST_P(HTTPTest, WWWAuthenticateHeader)
   EXPECT_EQ(1u, header->authParam().size());
   EXPECT_EQ("basic-realm", header->authParam()["realm"]);
 
-  headers.clear();
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_NONE(http::Headers().get<http::header::WWWAuthenticate>());
 
-  EXPECT_NONE(header);
-
-  headers["Www-Authenticate"] =
-    "Bearer realm=\"https://auth.docker.io/token\","
-    "service=\"registry.docker.io\","
-    "scope=\"repository:gilbertsong/inky:pull\"";
-
-  header = headers.get<http::header::WWWAuthenticate>();
+  header = http::Headers(
+      {{"Www-Authenticate",
+        "Bearer realm=\"https://auth.docker.io/token\", "
+        "service=\"registry.docker.io\","
+        "scope=\"repository:gilbertsong/inky:pull\""}})
+    .get<http::header::WWWAuthenticate>();
 
   ASSERT_SOME(header);
 
@@ -1632,35 +1641,70 @@ TEST_P(HTTPTest, WWWAuthenticateHeader)
   EXPECT_EQ("registry.docker.io", header->authParam()["service"]);
   EXPECT_EQ("repository:gilbertsong/inky:pull", header->authParam()["scope"]);
 
-  headers["Www-Authenticate"] = "";
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            ""}})
+        .get<http::header::WWWAuthenticate>());
 
-  EXPECT_ERROR(header);
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            " "}})
+        .get<http::header::WWWAuthenticate>());
 
-  headers["Www-Authenticate"] = " ";
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Digest"}})
+        .get<http::header::WWWAuthenticate>());
 
-  EXPECT_ERROR(header);
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Digest ="}})
+        .get<http::header::WWWAuthenticate>());
 
-  headers["Www-Authenticate"] = "Digest";
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Digest ,,"}})
+        .get<http::header::WWWAuthenticate>());
 
-  EXPECT_ERROR(header);
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Digest uri=\"/dir/index.html\",qop=auth"}})
+        .get<http::header::WWWAuthenticate>());
 
-  headers["Www-Authenticate"] = "Digest =";
-  header = headers.get<http::header::WWWAuthenticate>();
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Bearer =\"https://https://example.com\""}})
+        .get<http::header::WWWAuthenticate>());
 
-  EXPECT_ERROR(header);
+  // authParam keys cannot be quoted strings.
+  EXPECT_ERROR(
+      http::Headers(
+          {{"Www-Authenticate",
+            "Bearer \"realm\"=\"https://example.com\""}})
+        .get<http::header::WWWAuthenticate>());
 
-  headers["Www-Authenticate"] = "Digest ,,";
-  header = headers.get<http::header::WWWAuthenticate>();
+  // We do not incorrectly split if authParam values contain `=`
+  // delimiters inside quotes. This is a regression test for MESOS-9968.
+  header = http::Headers(
+               {{"Www-Authenticate",
+                 "Bearer realm="
+                 "\"https://nvcr.io/proxy_auth?scope="
+                 "repository:nvidia/tensorflow:pull,push\""}})
+             .get<http::header::WWWAuthenticate>();
 
-  EXPECT_ERROR(header);
-
-  headers["Www-Authenticate"] = "Digest uri=\"/dir/index.html\",qop=auth";
-  header = headers.get<http::header::WWWAuthenticate>();
-
-  EXPECT_ERROR(header);
+  ASSERT_SOME(header);
+  EXPECT_EQ("Bearer", header->authScheme());
+  ASSERT_EQ(hashset<string>{"realm"}, header->authParam().keys());
+  EXPECT_EQ(
+      "https://nvcr.io/proxy_auth?scope=repository:nvidia/tensorflow:pull,push",
+      header->authParam()["realm"]);
 }
 
 
@@ -2218,7 +2262,7 @@ TEST_F(HttpServeTest, Pipelining)
     .WillOnce(DoAll(FutureArg<0>(&request3), Return(promise3.future())))
     .WillRepeatedly(Return(http::OK()));
 
-  http::URL url("http", address.hostname().get(), address.port, "/");
+  http::URL url("http", address.lookup_hostname().get(), address.port, "/");
 
   http::Request request;
   request.method = "GET";
@@ -2313,7 +2357,7 @@ TEST_F(HttpServeTest, Discard)
   EXPECT_CALL(handler, handle(_))
     .WillOnce(DoAll(FutureArg<0>(&request1), Return(promise1.future())));
 
-  http::URL url("http", address.hostname().get(), address.port, "/");
+  http::URL url("http", address.lookup_hostname().get(), address.port, "/");
 
   http::Request request;
   request.method = "GET";
@@ -2450,7 +2494,7 @@ TEST(HttpServerTest, Pipeline)
     .WillOnce(DoAll(FutureArg<0>(&request3), Return(promise3.future())))
     .WillRepeatedly(Return(http::OK()));
 
-  http::URL url("http", address->hostname().get(), address->port, "/");
+  http::URL url("http", address->lookup_hostname().get(), address->port, "/");
 
   http::Request request;
   request.method = "GET";

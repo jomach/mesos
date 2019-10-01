@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -13,8 +15,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Check if all files given as arguments contain a license header"""
 
-# THE DOCKER EXECUTOR EXECUTABLE.
-#################################
-add_executable(mesos-docker-executor executor.cpp)
-target_link_libraries(mesos-docker-executor PRIVATE mesos)
+import re
+import sys
+
+for f in sys.argv[1:]:
+    if not any(
+            map(lambda x: re.match('.*(Licensed|Copyright)', x),
+                open(f).readlines())):
+        print("{} does not seem to contain a license header".format(f))
+        sys.exit(1)

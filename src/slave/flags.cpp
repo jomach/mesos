@@ -224,6 +224,21 @@ mesos::internal::slave::Flags::Flags()
       "volumes that each container uses.",
       "/var/run/mesos/isolators/docker/volume");
 
+  add(&Flags::docker_volume_chown,
+      "docker_volume_chown",
+      "Whether to chown the docker volume's mount point non-recursively\n"
+      "to the container user. Please notice that this flag is not recommended\n"
+      "to turn on if there is any docker volume shared by multiple non-root\n"
+      "users. By default, this flag is off.\n",
+      false);
+
+  add(&Flags::docker_ignore_runtime,
+      "docker_ignore_runtime",
+      "Ignore any runtime configuration specified in the Docker image. The\n"
+      "Mesos containerizer will not propagate Docker runtime specifications\n"
+      "such as `WORKDIR`, `ENV` and `CMD` to the container.\n",
+      false);
+
   add(&Flags::default_role,
       "default_role",
       "Any resources in the `--resources` flag that\n"
@@ -756,6 +771,28 @@ mesos::internal::slave::Flags::Flags()
       "This flag has the same syntax as `--effective_capabilities`."
      );
 
+  add(&Flags::default_container_shm_size,
+      "default_container_shm_size",
+      "The default size of the /dev/shm for the container which has its own\n"
+      "/dev/shm but does not specify the `shm_size` field in its `LinuxInfo`.\n"
+      "The format is [number][unit], number must be a positive integer and\n"
+      "unit can be B (bytes), KB (kilobytes), MB (megabytes), GB (gigabytes)\n"
+      "or TB (terabytes). Note that this flag is only relevant for the Mesos\n"
+      "Containerizer and it will be ignored if the `namespaces/ipc` isolator\n"
+      "is not enabled."
+      );
+
+  add(&Flags::disallow_sharing_agent_ipc_namespace,
+      "disallow_sharing_agent_ipc_namespace",
+      "If set to `true`, each top-level container will have its own IPC\n"
+      "namespace and /dev/shm, and if the framework requests to share the\n"
+      "agent IPC namespace and /dev/shm for the top level container, the\n"
+      "container launch will be rejected. If set to `false`, the top-level\n"
+      "containers will share the IPC namespace and /dev/shm with agent if\n"
+      "the framework requests it. This flag will be ignored if the\n"
+      "`namespaces/ipc` isolator is not enabled.\n",
+      false);
+
   add(&Flags::disallow_sharing_agent_pid_namespace,
       "disallow_sharing_agent_pid_namespace",
       "If set to `true`, each top-level container will have its own pid\n"
@@ -770,8 +807,8 @@ mesos::internal::slave::Flags::Flags()
   add(&Flags::agent_features,
       "agent_features",
       "JSON representation of agent features to whitelist. We always require\n"
-      "'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT', and\n"
-      "'AGENT_OPERATION_FEEDBACK'.\n"
+      "'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT',\n"
+      "'AGENT_OPERATION_FEEDBACK', and 'AGENT_DRAINING'.\n"
       "\n"
       "Example:\n"
       "{\n"
@@ -779,7 +816,8 @@ mesos::internal::slave::Flags::Flags()
       "        {\"type\": \"MULTI_ROLE\"},\n"
       "        {\"type\": \"HIERARCHICAL_ROLE\"},\n"
       "        {\"type\": \"RESERVATION_REFINEMENT\"},\n"
-      "        {\"type\": \"AGENT_OPERATION_FEEDBACK\"}\n"
+      "        {\"type\": \"AGENT_OPERATION_FEEDBACK\"},\n"
+      "        {\"type\": \"AGENT_DRAINING\"}\n"
       "    ]\n"
       "}\n",
       [](const Option<SlaveCapabilities>& agentFeatures) -> Option<Error> {
@@ -791,11 +829,12 @@ mesos::internal::slave::Flags::Flags()
           if (!capabilities.multiRole ||
               !capabilities.hierarchicalRole ||
               !capabilities.reservationRefinement ||
-              !capabilities.agentOperationFeedback) {
+              !capabilities.agentOperationFeedback ||
+              !capabilities.agentDraining) {
             return Error(
                 "At least the following agent features need to be enabled:"
                 " MULTI_ROLE, HIERARCHICAL_ROLE, RESERVATION_REFINEMENT,"
-                " AGENT_OPERATION_FEEDBACK");
+                " AGENT_OPERATION_FEEDBACK, and AGENT_DRAINING");
           }
 
           if (capabilities.resizeVolume && !capabilities.resourceProvider) {

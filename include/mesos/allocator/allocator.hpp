@@ -27,6 +27,7 @@
 
 #include <mesos/quota/quota.hpp>
 
+#include <mesos/resource_quantities.hpp>
 #include <mesos/resources.hpp>
 
 #include <process/future.hpp>
@@ -38,7 +39,6 @@
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
-#include "common/resource_quantities.hpp"
 
 namespace mesos {
 namespace allocator {
@@ -60,8 +60,7 @@ struct Options
   Option<DomainInfo> domain = None();
 
   // The minimum allocatable resource quantities, if any.
-  Option<std::vector<mesos::internal::ResourceQuantities>>
-    minAllocatableResources = None();
+  Option<std::vector<ResourceQuantities>> minAllocatableResources = None();
 
   size_t maxCompletedFrameworks = 0;
 
@@ -415,43 +414,17 @@ public:
       const std::set<std::string>& roles) = 0;
 
   /**
-   * Informs the allocator to set quota for the given role.
+   * Informs the allocator to update quota for the given role.
    *
    * It is up to the allocator implementation how to satisfy quota. An
    * implementation may employ different strategies for roles with or
-   * without quota. Hence an empty (or zero) quota is not necessarily the
-   * same as an absence of quota. Logically, this method implies that the
-   * given role should be transitioned to the group of roles with quota
-   * set. An allocator implementation may assert quota for the given role
-   * is not set prior to the call and react accordingly if this assumption
-   * is violated (i.e. fail).
-   *
-   * TODO(alexr): Consider returning a future which an allocator can fail
-   * in order to report failure.
-   *
-   * TODO(alexr): Consider adding an `updateQuota()` method which allows
-   * updating existing quota.
+   * without quota. All roles have a default quota defined as `DEFAULT_QUOTA`.
+   * Currently, it is no guarantees and no limits. Thus to "remove" a quota,
+   * one should simply update the quota to be `DEFAULT_QUOTA`.
    */
-  virtual void setQuota(
+  virtual void updateQuota(
       const std::string& role,
       const Quota& quota) = 0;
-
-  /**
-   * Informs the allocator to remove quota for the given role.
-   *
-   * An allocator implementation may employ different strategies for roles
-   * with or without quota. Hence an empty (or zero) quota is not necessarily
-   * the same as an absence of quota. Logically, this method implies that the
-   * given role should be transitioned to the group of roles without quota
-   * set (absence of quota). An allocator implementation may assert quota
-   * for the given role is set prior to the call and react accordingly if
-   * this assumption is violated (i.e. fail).
-   *
-   * TODO(alexr): Consider returning a future which an allocator can fail in
-   * order to report failure.
-   */
-  virtual void removeQuota(
-      const std::string& role) = 0;
 
   /**
    * Updates the weight associated with one or more roles. If a role

@@ -92,8 +92,8 @@ Example:
   </td>
   <td>
 JSON representation of agent features to whitelist. We always require
-'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT', and
-'AGENT_OPERATION_FEEDBACK'.
+'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT',
+'AGENT_OPERATION_FEEDBACK', and 'AGENT_DRAINING'.
 <p/>
 Example:
 <pre><code>
@@ -102,7 +102,8 @@ Example:
         {"type": "MULTI_ROLE"},
         {"type": "HIERARCHICAL_ROLE"},
         {"type": "RESERVATION_REFINEMENT"},
-        {"type": "AGENT_OPERATION_FEEDBACK"}
+        {"type": "AGENT_OPERATION_FEEDBACK"},
+        {"type": "AGENT_DRAINING"}
     ]
 }
 </pre></code>
@@ -577,6 +578,51 @@ this role. (default: *)
   </td>
 </tr>
 
+<tr id="default_container_shm_size">
+  <td>
+    --default_container_shm_size
+  </td>
+  <td>
+The default size of the /dev/shm for the container which has its own
+/dev/shm but does not specify the <code>shm_size</code> field in its
+<code>LinuxInfo</code>. The format is [number][unit], number must be
+a positive integer and unit can be B (bytes), KB (kilobytes), MB
+(megabytes), GB (gigabytes) or TB (terabytes). Note that this flag is
+only relevant for the Mesos Containerizer and it will be ignored if
+the <code>namespaces/ipc</code> isolator is not enabled.
+  </td>
+</tr>
+
+<tr id="disallow_sharing_agent_ipc_namespace">
+  <td>
+    --[no-]disallow_sharing_agent_ipc_namespace
+  </td>
+  <td>
+If set to <code>true</code>, each top-level container will have its own IPC
+namespace and /dev/shm, and if the framework requests to share the agent IPC
+namespace and /dev/shm for the top level container, the container launch will
+be rejected. If set to <code>false</code>, the top-level containers will share
+the IPC namespace and /dev/shm with agent if the framework requests it. This
+flag will be ignored if the <code>namespaces/ipc</code> isolator is not enabled.
+(default: false)
+  </td>
+</tr>
+
+<tr id="disallow_sharing_agent_pid_namespace">
+  <td>
+    --[no-]disallow_sharing_agent_pid_namespace
+  </td>
+  <td>
+If set to <code>true</code>, each top-level container will have its own pid
+namespace, and if the framework requests to share the agent pid namespace for
+the top level container, the container launch will be rejected. If set to
+<code>false</code>, the top-level containers will share the pid namespace with
+agent if the framework requests it. This flag will be ignored if the <code>
+namespaces/pid</code> isolator is not enabled.
+(default: false)
+  </td>
+</tr>
+
 <tr id="disk_profile_adaptor">
   <td>
     --disk_profile_adaptor=VALUE
@@ -634,6 +680,19 @@ Example JSON (<code>$HOME/.docker/config.json</code>):
   }
 }
 </code></pre>
+  </td>
+</tr>
+
+<tr id="docker_ignore_runtime">
+  <td>
+    --docker_ignore_runtime=VALUE
+  </td>
+  <td>
+Ignore any runtime configuration specified in the Docker image. The
+Mesos containerizer will not propagate Docker runtime specifications
+such as <code>WORKDIR</code>, <code>ENV</code> and <code>CMD</code>
+to the container.
+(default: false)
   </td>
 </tr>
 
@@ -734,6 +793,18 @@ Directory the Docker provisioner will store images in (default: /tmp/mesos/store
 The root directory where we checkpoint the information about docker
 volumes that each container uses.
 (default: /var/run/mesos/isolators/docker/volume)
+  </td>
+</tr>
+
+<tr id="docker_volume_chown">
+  <td>
+    --[no-]docker_volume_chown
+  </td>
+  <td>
+Whether to chown the docker volume's mount point non-recursively
+to the container user. Please notice that this flag is not recommended
+to turn on if there is any docker volume shared by multiple non-root
+users. By default, this flag is off. (default: false)
   </td>
 </tr>
 
@@ -1437,21 +1508,6 @@ not across reboots). This directory will be cleared on reboot.
 The absolute path for the directory in the container where the
 sandbox is mapped to.
 (default: /mnt/mesos/sandbox)
-  </td>
-</tr>
-
-<tr id="disallow_sharing_agent_pid_namespace">
-  <td>
-    --[no-]disallow_sharing_agent_pid_namespace
-  </td>
-  <td>
-If set to <code>true</code>, each top-level container will have its own pid
-namespace, and if the framework requests to share the agent pid namespace for
-the top level container, the container launch will be rejected. If set to
-<code>false</code>, the top-level containers will share the pid namespace with
-agent if the framework requests it. This flag will be ignored if the
-`namespaces/pid` isolator is not enabled.
-(default: false)
   </td>
 </tr>
 

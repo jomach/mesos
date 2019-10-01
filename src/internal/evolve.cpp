@@ -86,9 +86,21 @@ v1::AgentInfo evolve(const SlaveInfo& slaveInfo)
 }
 
 
+v1::ContainerInfo evolve(const ContainerInfo& containerInfo)
+{
+  return evolve<v1::ContainerInfo>(containerInfo);
+}
+
+
 v1::DomainInfo evolve(const DomainInfo& domainInfo)
 {
   return evolve<v1::DomainInfo>(domainInfo);
+}
+
+
+v1::DrainInfo evolve(const DrainInfo& drainInfo)
+{
+  return evolve<v1::DrainInfo>(drainInfo);
 }
 
 

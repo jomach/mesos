@@ -169,14 +169,14 @@ TEST_F(MasterTest, TaskRunning)
 
   // Ensure the hostname and url are set correctly.
   EXPECT_EQ(
-      slave.get()->pid.address.hostname().get(),
+      slave.get()->pid.address.lookup_hostname().get(),
       offers.get()[0].hostname());
 
   mesos::URL url;
   url.set_scheme("http");
   url.mutable_address()->set_ip(stringify(slave.get()->pid.address.ip));
   url.mutable_address()->set_hostname(
-      slave.get()->pid.address.hostname().get());
+      slave.get()->pid.address.lookup_hostname().get());
 
   url.mutable_address()->set_port(slave.get()->pid.address.port);
   url.set_path("/" + slave.get()->pid.id);
@@ -1447,7 +1447,7 @@ TEST_F(HostnameTest, LookupEnabled)
   ASSERT_SOME(master);
 
   EXPECT_EQ(
-      master.get()->pid.address.hostname().get(),
+      master.get()->pid.address.lookup_hostname().get(),
       master.get()->getMasterInfo().hostname());
 }
 
@@ -2956,13 +2956,15 @@ TEST_F(MasterTest, RecoverWithMinimumCapability)
       MasterInfo::Capability::Type_Name(MasterInfo::Capability::AGENT_UPDATE));
 
   EXPECT_TRUE(
-      Master::misingMinimumCapabilities(master.get()->getMasterInfo(), registry)
+      Master::missingMinimumCapabilities(
+          master.get()->getMasterInfo(), registry)
         .empty());
 
   registry.add_minimum_capabilities()->set_capability("SUPER_POWER");
 
   hashset<string> result =
-    Master::misingMinimumCapabilities(master->get()->getMasterInfo(), registry);
+    Master::missingMinimumCapabilities(
+        master->get()->getMasterInfo(), registry);
 
   hashset<string> expected = {"SUPER_POWER"};
 
@@ -3642,8 +3644,10 @@ TEST_F(MasterZooKeeperTest, MasterInfoAddress)
 
   // Protect from failures on those hosts where
   // hostname cannot be resolved.
-  if (master.get()->pid.address.hostname().isSome()) {
-    ASSERT_EQ(master.get()->pid.address.hostname().get(), address.hostname());
+  if (master.get()->pid.address.lookup_hostname().isSome()) {
+    ASSERT_EQ(
+        master.get()->pid.address.lookup_hostname().get(),
+        address.hostname());
   }
 
   driver.stop();
@@ -5032,8 +5036,9 @@ TEST_F(MasterTest, StateEndpoint)
 
   JSON::Value masterCapabilities = state.values.at("capabilities");
 
-  // Master should always have the AGENT_UPDATE capability
-  Try<JSON::Value> expectedCapabilities = JSON::parse("[\"AGENT_UPDATE\"]");
+  // Master should always have these default capabilities.
+  Try<JSON::Value> expectedCapabilities =
+    JSON::parse("[\"AGENT_UPDATE\", \"AGENT_DRAINING\", \"QUOTA_V2\"]");
 
   ASSERT_SOME(expectedCapabilities);
   EXPECT_TRUE(masterCapabilities.contains(expectedCapabilities.get()));
@@ -5311,7 +5316,8 @@ TEST_F(MasterTest, StateEndpointAgentCapabilities)
         "RESERVATION_REFINEMENT",
         "RESOURCE_PROVIDER",
         "RESIZE_VOLUME",
-        "AGENT_OPERATION_FEEDBACK"
+        "AGENT_OPERATION_FEEDBACK",
+        "AGENT_DRAINING"
       ]
     )~");
 
@@ -6317,7 +6323,7 @@ TEST_F(MasterTest, MasterFailoverLongLivedExecutor)
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
 
   Future<TaskStatus> status1;
-  EXPECT_CALL(sched, statusUpdate(&driver, TaskStatusTaskIdEq(task1)))
+  EXPECT_CALL(sched, statusUpdate(&driver, TaskStatusTaskIdEq(task1.task_id())))
     .WillOnce(FutureArg<1>(&status1))
     .WillRepeatedly(Return());
 
@@ -6361,7 +6367,7 @@ TEST_F(MasterTest, MasterFailoverLongLivedExecutor)
   task2.mutable_task_id()->set_value("2");
 
   Future<TaskStatus> status2;
-  EXPECT_CALL(sched, statusUpdate(&driver, TaskStatusTaskIdEq(task2)))
+  EXPECT_CALL(sched, statusUpdate(&driver, TaskStatusTaskIdEq(task2.task_id())))
     .WillOnce(FutureArg<1>(&status2))
     .WillRepeatedly(Return());
 
@@ -7184,10 +7190,10 @@ TEST_F(MasterTest, RejectFrameworkWithInvalidFailoverTimeout)
   FrameworkInfo framework = DEFAULT_FRAMEWORK_INFO;
 
   // Add invalid failover timeout to the FrameworkInfo.
-  // As the timeout is represented using nanoseconds as an int64, the
-  // following value converted to seconds is too large and does not
-  // fit in int64.
-  framework.set_failover_timeout(99999999999999999);
+  // As the timeout is internally represented using nanoseconds as an
+  // int64, the following value in seconds is too large and cannot be
+  // internally represented.
+  framework.set_failover_timeout(1e+17);
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -9004,8 +9010,8 @@ TEST_F(MasterTest, UpdateSlaveMessageWithPendingOffers)
   v1::Resource disk1 = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw());
 
-  Owned<v1::MockResourceProvider> resourceProvider(
-      new v1::MockResourceProvider(resourceProviderInfo, v1::Resources(disk1)));
+  Owned<v1::TestResourceProvider> resourceProvider(
+      new v1::TestResourceProvider(resourceProviderInfo, v1::Resources(disk1)));
 
   // Start and register a resource provider with a single disk resources.
   Owned<EndpointDetector> endpointDetector(
@@ -9014,9 +9020,13 @@ TEST_F(MasterTest, UpdateSlaveMessageWithPendingOffers)
   resourceProvider->start(std::move(endpointDetector), ContentType::PROTOBUF);
 
   AWAIT_READY(updateSlaveMessage);
-  ASSERT_TRUE(resourceProvider->info.has_id());
 
-  disk1.mutable_provider_id()->CopyFrom(resourceProvider->info.id());
+  Future<v1::ResourceProviderID> resourceProviderId =
+    resourceProvider->process->id();
+
+  AWAIT_READY(resourceProviderId);
+
+  disk1.mutable_provider_id()->CopyFrom(resourceProviderId.get());
 
   // Start and register a framework.
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
@@ -9051,10 +9061,10 @@ TEST_F(MasterTest, UpdateSlaveMessageWithPendingOffers)
   // of the new resource.
   v1::Resource disk2 = v1::createDiskResource(
       "100", "*", None(), None(), v1::createDiskSourceBlock());
-  disk2.mutable_provider_id()->CopyFrom(resourceProvider->info.id());
+  disk2.mutable_provider_id()->CopyFrom(resourceProviderId.get());
 
   v1::resource_provider::Call call;
-  call.mutable_resource_provider_id()->CopyFrom(resourceProvider->info.id());
+  call.mutable_resource_provider_id()->CopyFrom(resourceProviderId.get());
   call.set_type(v1::resource_provider::Call::UPDATE_STATE);
 
   v1::resource_provider::Call::UpdateState* updateState =
@@ -9124,7 +9134,7 @@ TEST_F(MasterTest, OperationUpdateDuringFailover)
   v1::Resources resourceProviderResources = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw(None(), "profile"));
 
-  v1::MockResourceProvider resourceProvider(
+  v1::TestResourceProvider resourceProvider(
       resourceProviderInfo,
       resourceProviderResources);
 
@@ -9180,7 +9190,7 @@ TEST_F(MasterTest, OperationUpdateDuringFailover)
           frameworkInfo.roles(0), DEFAULT_CREDENTIAL.principal()));
 
   Future<mesos::v1::resource_provider::Event::ApplyOperation> operation;
-  EXPECT_CALL(resourceProvider, applyOperation(_))
+  EXPECT_CALL(*resourceProvider.process, applyOperation(_))
     .WillOnce(FutureArg<0>(&operation));
 
   // Drop the operation updates for the finished operations.
@@ -9243,7 +9253,10 @@ TEST_F(MasterTest, OperationUpdateDuringFailover)
   EXPECT_CALL(sched, disconnected(&driver));
 
   // Finish the pending operation.
-  resourceProvider.operationDefault(operation.get());
+  dispatch(
+      *resourceProvider.process,
+      &v1::TestResourceProviderProcess::operationDefault,
+      operation.get());
 
   AWAIT_READY(updateOperationStatusMessage1);
   AWAIT_READY(updateOperationStatusMessage2);
@@ -9360,7 +9373,7 @@ TEST_F(MasterTest, OperationUpdateCompletedFramework)
   v1::Resources resourceProviderResources = v1::createDiskResource(
       "200", "*", None(), None(), v1::createDiskSourceRaw(None(), "profile"));
 
-  v1::MockResourceProvider resourceProvider(
+  v1::TestResourceProvider resourceProvider(
       resourceProviderInfo,
       resourceProviderResources);
 
@@ -9372,8 +9385,6 @@ TEST_F(MasterTest, OperationUpdateCompletedFramework)
   resourceProvider.start(endpointDetector, ContentType::PROTOBUF);
 
   AWAIT_READY(updateSlaveMessage);
-
-  ASSERT_TRUE(resourceProvider.info.has_id());
 
   // Start a framework to operate on offers.
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
@@ -9444,7 +9455,7 @@ TEST_F(MasterTest, OperationUpdateCompletedFramework)
   operationId.set_value("operation");
 
   Future<mesos::v1::resource_provider::Event::ApplyOperation> applyOperation;
-  EXPECT_CALL(resourceProvider, applyOperation(_))
+  EXPECT_CALL(*resourceProvider.process, applyOperation(_))
     .WillOnce(FutureArg<0>(&applyOperation));
 
   mesos->send(v1::createCallAccept(
@@ -9466,10 +9477,13 @@ TEST_F(MasterTest, OperationUpdateCompletedFramework)
     FUTURE_PROTOBUF(AcknowledgeOperationStatusMessage(), _, slave.get()->pid);
 
   Future<Nothing> acknowledgeOperationStatus;
-  EXPECT_CALL(resourceProvider, acknowledgeOperationStatus(_))
+  EXPECT_CALL(*resourceProvider.process, acknowledgeOperationStatus(_))
     .WillOnce(FutureSatisfy(&acknowledgeOperationStatus));
 
-  resourceProvider.operationDefault(applyOperation.get());
+  dispatch(
+      *resourceProvider.process,
+      &v1::TestResourceProviderProcess::operationDefault,
+      applyOperation.get());
 
   // We expect the master to acknowledge the operation status update.
   AWAIT_READY(acknowledgeOperationStatusMessage);
@@ -9903,7 +9917,7 @@ TEST_F(MasterTest, TaskStateMetrics)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(task1),
+          TaskStatusUpdateTaskIdEq(task1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(taskSequence1)
     .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, agentId));
@@ -9911,7 +9925,7 @@ TEST_F(MasterTest, TaskStateMetrics)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(task1),
+          TaskStatusUpdateTaskIdEq(task1.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(taskSequence1)
     .WillOnce(DoAll(
@@ -9954,7 +9968,7 @@ TEST_F(MasterTest, TaskStateMetrics)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(task2),
+          TaskStatusUpdateTaskIdEq(task2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(taskSequence2)
     .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, agentId));
@@ -9962,7 +9976,7 @@ TEST_F(MasterTest, TaskStateMetrics)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(task2),
+          TaskStatusUpdateTaskIdEq(task2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(taskSequence2)
     .WillOnce(v1::scheduler::SendAcknowledge(frameworkId, agentId));
@@ -9970,7 +9984,7 @@ TEST_F(MasterTest, TaskStateMetrics)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(task2),
+          TaskStatusUpdateTaskIdEq(task2.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_FINISHED))))
     .InSequence(taskSequence2)
     .WillOnce(FutureArg<1>(&finishedUpdate))
@@ -10281,7 +10295,7 @@ TEST_P(MasterTestPrePostReservationRefinement, LaunchGroup)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-          TaskStatusUpdateTaskIdEq(taskInfo),
+          TaskStatusUpdateTaskIdEq(taskInfo.task_id()),
           TaskStatusUpdateStateEq(v1::TASK_STARTING))))
     .InSequence(updateSequence)
     .WillOnce(DoAll(
@@ -10291,7 +10305,7 @@ TEST_P(MasterTestPrePostReservationRefinement, LaunchGroup)
   EXPECT_CALL(
       *scheduler,
       update(_, AllOf(
-            TaskStatusUpdateTaskIdEq(taskInfo),
+            TaskStatusUpdateTaskIdEq(taskInfo.task_id()),
             TaskStatusUpdateStateEq(v1::TASK_RUNNING))))
     .InSequence(updateSequence)
     .WillOnce(FutureArg<1>(&runningUpdate));

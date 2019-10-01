@@ -539,10 +539,22 @@ Try<Nothing> NetworkCniIsolatorProcess::_recover(
     containerNetwork.ifName = interfaces->front();
 
     if (state.isSome()) {
-      foreach (const mesos::NetworkInfo& networkInfo,
-               state->executor_info().container().network_infos()) {
-        if (networkInfo.name() == networkName) {
-          containerNetwork.networkInfo = networkInfo;
+      if (state->has_executor_info()) {
+        // This is the case that executor container joins CNI network.
+        foreach (const mesos::NetworkInfo& networkInfo,
+                 state->executor_info().container().network_infos()) {
+          if (networkInfo.name() == networkName) {
+            containerNetwork.networkInfo = networkInfo;
+          }
+        }
+      } else if (state->has_container_info()) {
+        // This is the case that nested container or standalone container
+        // joins CNI network.
+        foreach (const mesos::NetworkInfo& networkInfo,
+                 state->container_info().network_infos()) {
+          if (networkInfo.name() == networkName) {
+            containerNetwork.networkInfo = networkInfo;
+          }
         }
       }
     }
@@ -1437,12 +1449,29 @@ Future<Nothing> NetworkCniIsolatorProcess::_attach(
 Future<ContainerStatus> NetworkCniIsolatorProcess::status(
     const ContainerID& containerId)
 {
+  const bool isNestedContainer = containerId.has_parent();
+
   // TODO(jieyu): We don't create 'Info' struct for containers that
   // want to join the host network and have no image. Currently, we
   // rely on the slave/containerizer to set the IP addresses in
   // ContainerStatus.  Consider returning the IP address of the slave
   // here.
   if (!infos.contains(containerId)) {
+    if (isNestedContainer) {
+      // There are two cases that `infos` does not contain a nested container:
+      //   1. The nested container has no image and joins host network (i.e.,
+      //      it does not specify `NetworkInfo.name` and its parent joins host
+      //      network). In this case, we do not create `Info` struct for this
+      //      nested container.
+      //   2. The nested container joins the CNI network that its parent joins,
+      //      and then agent is restarted. After recovery `infos` will not
+      //      contain the nested container since we do not checkpoint it in the
+      //      runtime directory.
+      // For both of these two cases, to obtain the network info of the nested
+      // container, we should look up its parent.
+      return status(containerId.parent());
+    }
+
     return ContainerStatus();
   }
 
@@ -1450,8 +1479,6 @@ Future<ContainerStatus> NetworkCniIsolatorProcess::status(
   // wants to joins the parent's network, we should look up the IP
   // address of the root container of the hierarchy to which this
   // container belongs.
-  const bool isNestedContainer = containerId.has_parent();
-
   if (isNestedContainer && infos[containerId]->joinsParentsNetwork) {
     return status(containerId.parent());
   }
@@ -2217,7 +2244,7 @@ int NetworkCniIsolatorSetup::execute()
         Try<Nothing> touch = os::touch(target);
         if (touch.isError()) {
           cerr << "Failed to create the mount point '" << target
-               << "' in the container filesystem" << endl;
+               << "' in the container filesystem: " << touch.error() << endl;
           return EXIT_FAILURE;
         }
       } else if (os::stat::islink(target)) {
@@ -2231,7 +2258,7 @@ int NetworkCniIsolatorSetup::execute()
         Try<Nothing> touch = os::touch(target);
         if (touch.isError()) {
           cerr << "Failed to create the mount point '" << target
-               << "' in the container filesystem" << endl;
+               << "' in the container filesystem: " << touch.error() << endl;
           return EXIT_FAILURE;
         }
       }

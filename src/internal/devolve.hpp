@@ -54,12 +54,16 @@ namespace internal {
 CommandInfo devolve(const v1::CommandInfo& command);
 ContainerID devolve(const v1::ContainerID& containerId);
 Credential devolve(const v1::Credential& credential);
+DrainConfig devolve(const v1::DrainConfig& drainConfig);
+DrainInfo devolve(const v1::DrainInfo& drainInfo);
+DurationInfo devolve(const google::protobuf::Duration& duration);
 ExecutorID devolve(const v1::ExecutorID& executorId);
 FrameworkID devolve(const v1::FrameworkID& frameworkId);
 FrameworkInfo devolve(const v1::FrameworkInfo& frameworkInfo);
 HealthCheck devolve(const v1::HealthCheck& check);
 InverseOffer devolve(const v1::InverseOffer& inverseOffer);
 Offer devolve(const v1::Offer& offer);
+Offer::Operation devolve(const v1::Offer::Operation& operation);
 OperationStatus devolve(const v1::OperationStatus& status);
 Resource devolve(const v1::Resource& resource);
 ResourceProviderID devolve(const v1::ResourceProviderID& resourceProviderId);

@@ -129,9 +129,12 @@ using std::tuple;
 using std::vector;
 
 using mesos::authorization::createSubject;
+using mesos::authorization::DEACTIVATE_AGENT;
+using mesos::authorization::DRAIN_AGENT;
 using mesos::authorization::GET_MAINTENANCE_SCHEDULE;
 using mesos::authorization::GET_MAINTENANCE_STATUS;
 using mesos::authorization::MARK_AGENT_GONE;
+using mesos::authorization::REACTIVATE_AGENT;
 using mesos::authorization::SET_LOG_LEVEL;
 using mesos::authorization::START_MAINTENANCE;
 using mesos::authorization::STOP_MAINTENANCE;
@@ -364,11 +367,20 @@ Future<Response> Master::Http::api(
     case mesos::master::Call::STOP_MAINTENANCE:
       return stopMaintenance(call, principal, acceptType);
 
+    case mesos::master::Call::DRAIN_AGENT:
+      return drainAgent(call, principal, acceptType);
+
+    case mesos::master::Call::DEACTIVATE_AGENT:
+      return deactivateAgent(call, principal, acceptType);
+
+    case mesos::master::Call::REACTIVATE_AGENT:
+      return reactivateAgent(call, principal, acceptType);
+
     case mesos::master::Call::GET_QUOTA:
       return quotaHandler.status(call, principal, acceptType);
 
     case mesos::master::Call::UPDATE_QUOTA:
-      return NotImplemented();
+      return quotaHandler.update(call, principal);
 
     // TODO(bmahler): Add this to a deprecated call section
     // at the bottom once deprecated by `UPDATE_QUOTA`.
@@ -602,7 +614,7 @@ Future<Response> Master::Http::scheduler(
     StreamingHttpConnection<v1::scheduler::Event> http(
         pipe.writer(), acceptType, streamId);
 
-    master->subscribe(http, call.subscribe());
+    master->subscribe(http, std::move(*call.mutable_subscribe()));
 
     return ok;
   }
@@ -714,6 +726,10 @@ Future<Response> Master::Http::scheduler(
     case scheduler::Call::REQUEST:
       master->request(framework, call.request());
       return Accepted();
+
+    case scheduler::Call::UPDATE_FRAMEWORK:
+      return master->updateFramework(
+          std::move(*call.mutable_update_framework()));
 
     case scheduler::Call::UNKNOWN:
       LOG(WARNING) << "Received 'UNKNOWN' call";
@@ -2071,7 +2087,11 @@ mesos::master::Response::GetAgents Master::Http::_getAgents(
   foreachvalue (const Slave* slave, master->slaves.registered) {
     mesos::master::Response::GetAgents::Agent* agent = getAgents.add_agents();
     *agent =
-        protobuf::master::event::createAgentResponse(*slave, approvers);
+        protobuf::master::event::createAgentResponse(
+            *slave,
+            master->slaves.draining.get(slave->id),
+            master->slaves.deactivated.contains(slave->id),
+            approvers);
   }
 
   foreachvalue (const SlaveInfo& slaveInfo, master->slaves.recovered) {
@@ -2093,8 +2113,11 @@ string Master::Http::QUOTA_HELP()
 {
   return HELP(
     TLDR(
-        "Gets or updates quota for roles."),
+        "(Deprecated) Gets or updates quota for roles."),
     DESCRIPTION(
+        "NOTE: This endpoint is deprecated in favor of using the v1 master",
+        "calls: UPDATE_QUOTA and GET_QUOTA.",
+        "",
         "Returns 200 OK when the quota was queried or updated successfully.",
         "",
         "Returns 307 TEMPORARY_REDIRECT redirect to the leading master when",
@@ -2123,6 +2146,7 @@ string Master::Http::QUOTA_HELP()
 }
 
 
+// Deprecated in favor of v1 UPDATE_QUOTA and GET_QUOTA.
 Future<Response> Master::Http::quota(
     const Request& request,
     const Option<Principal>& principal) const
@@ -2668,7 +2692,7 @@ Future<Response> Master::Http::getRoles(
     .then(defer(master->self(),
         [this, contentType](const Owned<ObjectApprovers>& approvers)
           -> Response {
-      const vector<string> filteredRoles = master->filterRoles(approvers);
+      const vector<string> knownRoles = master->knownRoles();
 
       mesos::master::Response response;
       response.set_type(mesos::master::Response::GET_ROLES);
@@ -2676,28 +2700,44 @@ Future<Response> Master::Http::getRoles(
       mesos::master::Response::GetRoles* getRoles =
         response.mutable_get_roles();
 
-      foreach (const string& name, filteredRoles) {
-        mesos::Role role;
-
-        if (master->weights.contains(name)) {
-          role.set_weight(master->weights[name]);
-        } else {
-          role.set_weight(1.0);
+      foreach (const string& name, knownRoles) {
+        if (!approvers->approved<VIEW_ROLE>(name)) {
+          continue;
         }
 
-        if (master->roles.contains(name)) {
-          Role* role_ = master->roles.at(name);
+        mesos::Role* role = getRoles->add_roles();
 
-          role.mutable_resources()->CopyFrom(role_->allocatedResources());
+        role->set_name(name);
 
-          foreachkey (const FrameworkID& frameworkId, role_->frameworks) {
-            role.add_frameworks()->CopyFrom(frameworkId);
+        role->set_weight(master->weights.get(name).getOrElse(DEFAULT_WEIGHT));
+
+        RoleResourceBreakdown resourceBreakdown(master, name);
+
+        ResourceQuantities allocatedAndOffered =
+          resourceBreakdown.allocated() + resourceBreakdown.offered();
+
+        // `resources` will be deprecated in favor of
+        // `offered`, `allocated`, `reserved`, and quota consumption.
+        // As a result, we don't bother trying to expose more
+        // than {cpus, mem, disk, gpus} since we don't know if
+        // anything outside this set is of type SCALAR.
+        foreach (const auto& quantity, allocatedAndOffered) {
+          if (quantity.first == "cpus" || quantity.first == "mem" ||
+              quantity.first == "disk" || quantity.first == "gpus") {
+            Resource* resource = role->add_resources();
+            resource->set_name(quantity.first);
+            resource->set_type(Value::SCALAR);
+            *resource->mutable_scalar() = quantity.second;
           }
         }
 
-        role.set_name(name);
+        Option<Role*> role_ = master->roles.get(name);
 
-        getRoles->add_roles()->CopyFrom(role);
+        if (role_.isSome()) {
+          foreachkey (const FrameworkID& frameworkId, (*role_)->frameworks) {
+            *role->add_frameworks() = frameworkId;
+          }
+        }
       }
 
       return OK(serialize(contentType, evolve(response)),
@@ -3845,6 +3885,271 @@ Future<Response> Master::Http::getMaintenanceStatus(
 }
 
 
+Future<Response> Master::Http::_drainAgent(
+    const SlaveID& slaveId,
+    const Option<DurationInfo>& maxGracePeriod,
+    const bool markGone,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  if (!approvers->approved<DRAIN_AGENT>()) {
+    return Forbidden();
+  }
+
+  if (markGone && !approvers->approved<MARK_AGENT_GONE>()) {
+    return Forbidden();
+  }
+
+  // Check that the agent is either recovering, registered, or unreachable.
+  if (!master->slaves.recovered.contains(slaveId) &&
+      !master->slaves.registered.contains(slaveId) &&
+      !master->slaves.unreachable.contains(slaveId)) {
+    return BadRequest("Unknown agent");
+  }
+
+  // If this agent is being marked gone, then no draining can be performed.
+  if (master->slaves.markingGone.contains(slaveId)) {
+    return Conflict("Agent is currently being marked gone");
+  }
+
+  // Save the draining info to the registry.
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new DrainAgent(slaveId, maxGracePeriod, markGone)))
+    .onAny([](const Future<bool>& result) {
+      CHECK_READY(result)
+        << "Failed to update draining info in the registry";
+    })
+    .then(defer(
+        master->self(),
+        [this, slaveId, maxGracePeriod, markGone](bool result) -> Response {
+          // Update the in-memory state.
+          DrainConfig drainConfig;
+          drainConfig.set_mark_gone(markGone);
+
+          if (maxGracePeriod.isSome()) {
+            drainConfig.mutable_max_grace_period()
+              ->CopyFrom(maxGracePeriod.get());
+          }
+
+          DrainInfo drainInfo;
+          drainInfo.set_state(DRAINING);
+          drainInfo.mutable_config()->CopyFrom(drainConfig);
+
+          master->slaves.draining[slaveId] = drainInfo;
+
+          // Deactivate the agent.
+          master->slaves.deactivated.insert(slaveId);
+
+          Slave* slave = master->slaves.registered.get(slaveId);
+          if (slave != nullptr) {
+            master->deactivate(slave);
+
+            // Tell the agent to start draining.
+            DrainSlaveMessage message;
+            message.mutable_config()->CopyFrom(drainConfig);
+            master->send(slave->pid, message);
+
+            slave->estimatedDrainStartTime = Clock::now();
+
+            // Check if the agent is already drained and transition it
+            // appropriately if so.
+            master->checkAndTransitionDrainingAgent(slave);
+          }
+
+          return OK();
+        }));
+}
+
+
+Future<Response> Master::Http::drainAgent(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(mesos::master::Call::DRAIN_AGENT, call.type());
+  CHECK(call.has_drain_agent());
+
+  SlaveID slaveId = call.drain_agent().slave_id();
+  Slave* slave = master->slaves.registered.get(slaveId);
+
+  if (slave != nullptr) {
+    // Check that the targeted agent is not part of a maintenance schedule.
+    // NOTE: This is a best-effort check, because it is possible to drain
+    // an agent, and then change the agent's hostname/IP into a MachineID
+    // in a maintenance schedule. Also, the MachineID of unreachable agents
+    // is unknown until they reregister.
+    //
+    // TODO(josephw): Reconsider this check once the maintenance and agent
+    // draining features are integrated.
+    //
+    // TODO(josephw): Check this condition against unreachable agents
+    // once MESOS-9884 is resolved.
+    if (!master->maintenance.schedules.empty()) {
+      foreach (
+          const mesos::maintenance::Window& window,
+          master->maintenance.schedules.front().windows()) {
+        foreach (const MachineID& machineId, window.machine_ids()) {
+          if (machineId == slave->machineId) {
+            return BadRequest(
+                "Agent " + stringify(slaveId) + " is part of a maintenance"
+                " schedule under Machine " + stringify(machineId));
+          }
+        }
+      }
+    }
+
+    // Check that the targeted agent is capable of `AGENT_DRAINING`.
+    // NOTE: This is a best-effort check, because it is possible to drain
+    // an agent, and then downgrade the agent to a version that does not
+    // support draining. Also, the capabilities of unreachable agents
+    // are unknown until they reregister.
+    //
+    // TODO(josephw): Check this condition against unreachable agents
+    // once MESOS-9884 is resolved.
+    if (!slave->capabilities.agentDraining) {
+      return BadRequest(
+          "Agent " + stringify(slaveId) + " is not capable of draining");
+    }
+  }
+
+  Option<DurationInfo> maxGracePeriod;
+  if (call.drain_agent().has_max_grace_period()) {
+    maxGracePeriod = call.drain_agent().max_grace_period();
+  }
+
+  bool markGone = call.drain_agent().mark_gone();
+
+  return ObjectApprovers::create(
+      master->authorizer,
+      principal,
+      {DRAIN_AGENT, MARK_AGENT_GONE})
+    .then(defer(
+      master->self(),
+      [this, slaveId, maxGracePeriod, markGone](
+          const Owned<ObjectApprovers>& approvers) {
+        return _drainAgent(slaveId, maxGracePeriod, markGone, approvers);
+      }));
+}
+
+
+Future<Response> Master::Http::_deactivateAgent(
+    const SlaveID& slaveId,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  if (!approvers->approved<DEACTIVATE_AGENT>()) {
+    return Forbidden();
+  }
+
+  // Check that the agent is either recovering, registered, or unreachable.
+  if (!master->slaves.recovered.contains(slaveId) &&
+      !master->slaves.registered.contains(slaveId) &&
+      !master->slaves.unreachable.contains(slaveId)) {
+    return BadRequest("Unknown agent");
+  }
+
+  // Save the deactivation to the registry.
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new DeactivateAgent(slaveId)))
+    .onAny([](const Future<bool>& result) {
+      CHECK_READY(result)
+        << "Failed to deactivate agent in the registry";
+    })
+    .then(defer(master->self(), [this, slaveId](bool result) -> Response {
+      // Deactivate the agent.
+      master->slaves.deactivated.insert(slaveId);
+
+      Slave* slave = master->slaves.registered.get(slaveId);
+      if (slave != nullptr) {
+        master->deactivate(slave);
+      }
+
+      return OK();
+    }));
+}
+
+
+Future<Response> Master::Http::deactivateAgent(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(mesos::master::Call::DEACTIVATE_AGENT, call.type());
+  CHECK(call.has_deactivate_agent());
+
+  SlaveID slaveId = call.deactivate_agent().slave_id();
+
+  return ObjectApprovers::create(
+      master->authorizer,
+      principal,
+      {DEACTIVATE_AGENT})
+    .then(defer(
+      master->self(),
+      [this, slaveId](
+          const Owned<ObjectApprovers>& approvers) {
+        return _deactivateAgent(slaveId, approvers);
+      }));
+}
+
+
+Future<Response> Master::Http::_reactivateAgent(
+    const SlaveID& slaveId,
+    const Owned<ObjectApprovers>& approvers) const
+{
+  if (!approvers->approved<REACTIVATE_AGENT>()) {
+    return Forbidden();
+  }
+
+  // Check that the agent is deactivated.
+  if (!master->slaves.deactivated.contains(slaveId)) {
+    return BadRequest("Agent is not deactivated");
+  }
+
+  // Save the reactivation to the registry.
+  return master->registrar->apply(Owned<RegistryOperation>(
+      new ReactivateAgent(slaveId)))
+    .onAny([](const Future<bool>& result) {
+      CHECK_READY(result)
+        << "Failed to reactivate agent in the registry";
+    })
+    .then(defer(master->self(), [this, slaveId](bool result) -> Response {
+      // Reactivate the agent.
+      master->slaves.draining.erase(slaveId);
+      master->slaves.deactivated.erase(slaveId);
+
+      Slave* slave = master->slaves.registered.get(slaveId);
+      if (slave != nullptr) {
+        master->reactivate(slave);
+      }
+
+      slave->estimatedDrainStartTime = None();
+
+      return OK();
+    }));
+}
+
+
+Future<Response> Master::Http::reactivateAgent(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(mesos::master::Call::REACTIVATE_AGENT, call.type());
+  CHECK(call.has_reactivate_agent());
+
+  SlaveID slaveId = call.reactivate_agent().slave_id();
+
+  return ObjectApprovers::create(
+      master->authorizer,
+      principal,
+      {REACTIVATE_AGENT})
+    .then(defer(
+      master->self(),
+      [this, slaveId](
+          const Owned<ObjectApprovers>& approvers) {
+        return _reactivateAgent(slaveId, approvers);
+      }));
+}
+
+
 string Master::Http::UNRESERVE_HELP()
 {
   return HELP(
@@ -4031,13 +4336,7 @@ Future<Response> Master::Http::_operation(
     // NOTE: However it's entirely possible that these resources are
     // offered to other frameworks in the next 'allocate' and the filter
     // cannot prevent it.
-    master->allocator->recoverResources(
-        offer->framework_id(),
-        offer->slave_id(),
-        offer->resources(),
-        Filters());
-
-    master->removeOffer(offer, true); // Rescind!
+    master->rescindOffer(offer, Filters());
 
     // If we've rescinded enough offers to cover 'operation', we're done.
     Try<Resources> updatedRecovered = totalRecovered.apply(operation);

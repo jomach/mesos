@@ -23,10 +23,12 @@
 
 #include <mesos/slave/isolator.hpp>
 
-#include <process/id.hpp>
+#include <process/clock.hpp>
 #include <process/http.hpp>
+#include <process/id.hpp>
 #include <process/sequence.hpp>
 #include <process/shared.hpp>
+#include <process/time.hpp>
 
 #include <process/metrics/counter.hpp>
 
@@ -72,7 +74,8 @@ public:
       GarbageCollector* gc = nullptr,
       SecretResolver* secretResolver = nullptr,
       const Option<NvidiaComponents>& nvidia = None(),
-      VolumeGidManager* volumeGidManager = nullptr);
+      VolumeGidManager* volumeGidManager = nullptr,
+      PendingFutureTracker* futureTracker = nullptr);
 
   static Try<MesosContainerizer*> create(
       const Flags& flags,
@@ -227,6 +230,7 @@ public:
 private:
   enum State
   {
+    STARTING,
     PROVISIONING,
     PREPARING,
     ISOLATING,
@@ -349,7 +353,10 @@ private:
 
   struct Container
   {
-    Container() : sequence("mesos-container-status-updates") {}
+    Container()
+      : state(STARTING),
+        lastStateTransition(process::Clock::now()),
+        sequence("mesos-container-status-updates") {}
 
     // Promise for futures returned from wait().
     process::Promise<mesos::slave::ContainerTermination> termination;
@@ -421,6 +428,7 @@ private:
     Option<mesos::slave::ContainerLaunchInfo> launchInfo;
 
     State state;
+    process::Time lastStateTransition;
 
     // Used when `status` needs to be collected from isolators
     // associated with this container. `Sequence` allows us to

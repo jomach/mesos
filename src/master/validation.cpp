@@ -24,6 +24,7 @@
 
 #include <glog/logging.h>
 
+#include <mesos/resource_quantities.hpp>
 #include <mesos/roles.hpp>
 #include <mesos/type_utils.hpp>
 
@@ -40,7 +41,6 @@
 #include "checks/health_checker.hpp"
 
 #include "common/protobuf_utils.hpp"
-#include "common/resource_quantities.hpp"
 #include "common/validation.hpp"
 
 #include "master/master.hpp"
@@ -236,6 +236,24 @@ Option<Error> validate(const mesos::master::Call& call)
     case mesos::master::Call::STOP_MAINTENANCE:
       if (!call.has_stop_maintenance()) {
         return Error("Expecting 'stop_maintenance' to be present");
+      }
+      return None();
+
+    case mesos::master::Call::DRAIN_AGENT:
+      if (!call.has_drain_agent()) {
+        return Error("Expecting 'drain_agent' to be present");
+      }
+      return None();
+
+    case mesos::master::Call::DEACTIVATE_AGENT:
+      if (!call.has_deactivate_agent()) {
+        return Error("Expecting 'deactivate_agent' to be present");
+      }
+      return None();
+
+    case mesos::master::Call::REACTIVATE_AGENT:
+      if (!call.has_reactivate_agent()) {
+        return Error("Expecting 'reactivate_agent' to be present");
       }
       return None();
 
@@ -566,6 +584,77 @@ Option<Error> validate(const mesos::FrameworkInfo& frameworkInfo)
   return None();
 }
 
+
+Option<Error> validateUpdate(
+    const FrameworkInfo& oldInfo,
+    const FrameworkInfo& newInfo)
+{
+  Option<string> oldPrincipal = None();
+  if (oldInfo.has_principal()) {
+    oldPrincipal = oldInfo.principal();
+  }
+
+  Option<string> newPrincipal = None();
+  if (newInfo.has_principal()) {
+    newPrincipal = newInfo.principal();
+  }
+
+  if (oldPrincipal != newPrincipal) {
+    // We should not expose the old principal to the 'scheduler' which tries
+    // to subscribe with a known framework ID but another principal.
+    // However, it still should be possible for the people having access to
+    // the master to understand what is going on, hence the log message.
+    LOG(WARNING)
+      << "Framework " << oldInfo.id() << " which had a principal "
+      << " '" << oldPrincipal.getOrElse("<NONE>") << "'"
+      << " tried to (re)subscribe with a new principal "
+      << " '" << newPrincipal.getOrElse("<NONE>") << "'";
+
+    return Error("Changing framework's principal is not allowed.");
+  }
+
+  if (newInfo.user() != oldInfo.user()) {
+    return Error(
+        "Updating 'FrameworkInfo.user' is unsupported"
+        "; attempted to update from '" + oldInfo.user() + "'"
+        " to '" + newInfo.user() + "'");
+  }
+
+  if (newInfo.checkpoint() != oldInfo.checkpoint()) {
+    return Error(
+        "Updating 'FrameworkInfo.checkpoint' is unsupported"
+        "; attempted to update"
+        " from '" + stringify(oldInfo.checkpoint()) + "'"
+        " to '" + stringify(newInfo.checkpoint()) + "'");
+  }
+
+  return None();
+}
+
+
+void preserveImmutableFields(
+    const FrameworkInfo& oldInfo,
+    FrameworkInfo* newInfo)
+{
+  if (newInfo->user() != oldInfo.user()) {
+    LOG(WARNING)
+      << "Cannot update 'FrameworkInfo.user' to '" << newInfo->user() << "'"
+      << " for framework " << oldInfo.id() << "; see MESOS-703";
+
+    newInfo->set_user(oldInfo.user());
+  }
+
+  if (newInfo->checkpoint() != oldInfo.checkpoint()) {
+    LOG(WARNING)
+      << "Cannot update FrameworkInfo.checkpoint to"
+      << " '" << stringify(newInfo->checkpoint()) << "'"
+      << " for framework " << oldInfo.id() << "; see MESOS-703";
+
+    newInfo->set_checkpoint(oldInfo.checkpoint());
+  }
+}
+
+
 } // namespace framework {
 
 
@@ -722,6 +811,18 @@ Option<Error> validate(
     case mesos::scheduler::Call::REQUEST:
       if (!call.has_request()) {
         return Error("Expecting 'request' to be present");
+      }
+      return None();
+
+    case mesos::scheduler::Call::UPDATE_FRAMEWORK:
+      if (!call.has_update_framework()) {
+        return Error("Expecting 'update_framework' to be present");
+      }
+
+      if (call.framework_id() !=
+          call.update_framework().framework_info().id()) {
+        return Error(
+            "'framework_id' differs from 'update_framework.framework_info.id'");
       }
       return None();
 

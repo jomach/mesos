@@ -113,7 +113,8 @@ Future<std::shared_ptr<SocketImpl>> PollSocketImpl::accept()
 }
 
 
-Future<Nothing> PollSocketImpl::connect(const Address& address)
+Future<Nothing> PollSocketImpl::connect(
+    const Address& address)
 {
   Try<Nothing, SocketError> connect = network::connect(get(), address);
   if (connect.isError()) {
@@ -158,6 +159,14 @@ Future<Nothing> PollSocketImpl::connect(const Address& address)
   return Nothing();
 }
 
+#ifdef USE_SSL_SOCKET
+Future<Nothing> PollSocketImpl::connect(
+    const Address& address,
+    const openssl::TLSClientConfig& config)
+{
+  LOG(FATAL) << "TLS config was passed to a PollSocket.";
+}
+#endif
 
 Future<size_t> PollSocketImpl::recv(char* data, size_t size)
 {

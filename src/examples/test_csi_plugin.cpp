@@ -42,6 +42,7 @@
 #include <stout/bytes.hpp>
 #include <stout/flags.hpp>
 #include <stout/foreach.hpp>
+#include <stout/fs.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/none.hpp>
 #include <stout/option.hpp>
@@ -59,13 +60,14 @@
 
 #include "csi/v0_utils.hpp"
 #include "csi/v1_utils.hpp"
+#include "csi/volume_manager.hpp"
 
 #include "linux/fs.hpp"
 
 #include "logging/logging.hpp"
 
 namespace http = process::http;
-namespace fs = mesos::internal::fs;
+namespace internal = mesos::internal;
 
 using std::cerr;
 using std::cout;
@@ -94,6 +96,8 @@ using grpc::ServerCompletionQueue;
 using grpc::ServerContext;
 using grpc::Status;
 using grpc::WriteOptions;
+
+using mesos::csi::VolumeInfo;
 
 using mesos::csi::types::VolumeCapability;
 
@@ -142,6 +146,12 @@ public:
         "specified as a semicolon-delimited list of param=value pairs.\n"
         "(Example: 'param1=value1;param2=value2')");
 
+    add(&Flags::volume_metadata,
+        "volume_metadata",
+        "The static properties to add to the contextual information of each\n"
+        "volume. The metadata are specified as a semicolon-delimited list of\n"
+        "prop=value pairs. (Example: 'prop1=value1;prop2=value2')");
+
     add(&Flags::volumes,
         "volumes",
         "Creates preprovisioned volumes upon start-up. The volumes are\n"
@@ -160,6 +170,7 @@ public:
   string work_dir;
   Bytes available_capacity;
   Option<string> create_parameters;
+  Option<string> volume_metadata;
   Option<string> volumes;
   Option<string> forward;
 };
@@ -180,53 +191,60 @@ public:
       const string& _workDir,
       const Bytes& _availableCapacity,
       const hashmap<string, string>& _createParameters,
+      const hashmap<string, string>& _volumeMetadata,
       const hashmap<string, Bytes>& _volumes)
     : apiVersion(_apiVersion),
       endpoint(_endpoint),
       workDir(_workDir),
       availableCapacity(_availableCapacity),
-      createParameters(_createParameters.begin(), _createParameters.end())
+      createParameters(_createParameters.begin(), _createParameters.end()),
+      volumeMetadata(_volumeMetadata.begin(), _volumeMetadata.end())
   {
     // Construct the default mount volume capability.
     defaultVolumeCapability.mutable_mount();
     defaultVolumeCapability.mutable_access_mode()
       ->set_mode(VolumeCapability::AccessMode::SINGLE_NODE_WRITER);
 
-    // Scan for preprovisioned volumes.
+    Bytes usedCapacity(0);
+
+    // Scan for created volumes.
     //
     // TODO(jieyu): Consider not using CHECKs here.
-    Try<list<string>> paths = os::ls(workDir);
-    CHECK_SOME(paths);
-
-    foreach (const string& path, paths.get()) {
-      Try<VolumeInfo> volumeInfo = parseVolumePath(path);
-      CHECK_SOME(volumeInfo);
-
-      CHECK(!volumes.contains(volumeInfo->id));
-      volumes.put(volumeInfo->id, volumeInfo.get());
-
-      if (!_volumes.contains(volumeInfo->id)) {
-        CHECK_GE(availableCapacity, volumeInfo->size);
-        availableCapacity -= volumeInfo->size;
-      }
+    Try<list<string>> paths = fs::list(path::join(workDir, "*-*"));
+    foreach (const string& path, CHECK_NOTERROR(paths)) {
+      volumes.put(path, CHECK_NOTERROR(parseVolumePath(path)));
+      usedCapacity += volumes.at(path).capacity;
     }
 
+    // Create preprovisioned volumes if they have not existed yet.
     foreachpair (const string& name, const Bytes& capacity, _volumes) {
-      if (volumes.contains(name)) {
+      Option<VolumeInfo> found = findVolumeByName(name);
+
+      if (found.isSome()) {
+        CHECK_EQ(found->capacity, capacity)
+          << "Expected preprovisioned volume '" << name << "' to be "
+          << capacity << " but found " << found->capacity << " instead";
+
+        usedCapacity -= found->capacity;
         continue;
       }
 
-      VolumeInfo volumeInfo;
-      volumeInfo.id = name;
-      volumeInfo.size = capacity;
+      VolumeInfo volumeInfo{
+        capacity, getVolumePath(capacity, name), volumeMetadata};
 
-      const string path = getVolumePath(volumeInfo);
+      Try<Nothing> mkdir = os::mkdir(volumeInfo.id);
+      CHECK_SOME(mkdir)
+        << "Failed to create directory for preprovisioned volume '" << name
+        << "': " << mkdir.error();
 
-      Try<Nothing> mkdir = os::mkdir(path);
-      CHECK_SOME(mkdir);
-
-      volumes.put(volumeInfo.id, volumeInfo);
+      volumes.put(volumeInfo.id, std::move(volumeInfo));
     }
+
+    CHECK_GE(availableCapacity, usedCapacity)
+      << "Insufficient available capacity for volumes, expected to be at least "
+      << usedCapacity;
+
+    availableCapacity -= usedCapacity;
   }
 
   void run();
@@ -406,14 +424,9 @@ public:
       csi::v1::NodeGetInfoResponse* response) override;
 
 private:
-  struct VolumeInfo
-  {
-    string id;
-    Bytes size;
-  };
-
-  string getVolumePath(const VolumeInfo& volumeInfo);
-  Try<VolumeInfo> parseVolumePath(const string& path);
+  string getVolumePath(const Bytes& capacity, const string& name);
+  Try<VolumeInfo> parseVolumePath(const string& dir);
+  Option<VolumeInfo> findVolumeByName(const string& name);
 
   Try<VolumeInfo, StatusError> createVolume(
       const string& name,
@@ -479,6 +492,7 @@ private:
   Bytes availableCapacity;
   VolumeCapability defaultVolumeCapability;
   Map<string, string> createParameters;
+  Map<string, string> volumeMetadata;
   hashmap<string, VolumeInfo> volumes;
 };
 
@@ -568,9 +582,8 @@ Status TestCSIPlugin::CreateVolume(
   }
 
   response->mutable_volume()->set_id(result->id);
-  response->mutable_volume()->set_capacity_bytes(result->size.bytes());
-  (*response->mutable_volume()->mutable_attributes())["path"] =
-    getVolumePath(result.get());
+  response->mutable_volume()->set_capacity_bytes(result->capacity.bytes());
+  *response->mutable_volume()->mutable_attributes() = result->context;
 
   return Status::OK;
 }
@@ -688,8 +701,8 @@ Status TestCSIPlugin::ListVolumes(
   foreach (const VolumeInfo& volumeInfo, result.get()) {
     csi::v0::Volume* volume = response->add_entries()->mutable_volume();
     volume->set_id(volumeInfo.id);
-    volume->set_capacity_bytes(volumeInfo.size.bytes());
-    (*volume->mutable_attributes())["path"] = getVolumePath(volumeInfo);
+    volume->set_capacity_bytes(volumeInfo.capacity.bytes());
+    *volume->mutable_attributes() = volumeInfo.context;
   }
 
   return Status::OK;
@@ -925,9 +938,8 @@ Status TestCSIPlugin::CreateVolume(
   }
 
   response->mutable_volume()->set_volume_id(result->id);
-  response->mutable_volume()->set_capacity_bytes(result->size.bytes());
-  (*response->mutable_volume()->mutable_volume_context())["path"] =
-    getVolumePath(result.get());
+  response->mutable_volume()->set_capacity_bytes(result->capacity.bytes());
+  *response->mutable_volume()->mutable_volume_context() = result->context;
 
   return Status::OK;
 }
@@ -1050,8 +1062,8 @@ Status TestCSIPlugin::ListVolumes(
   foreach (const VolumeInfo& volumeInfo, result.get()) {
     csi::v1::Volume* volume = response->add_entries()->mutable_volume();
     volume->set_volume_id(volumeInfo.id);
-    volume->set_capacity_bytes(volumeInfo.size.bytes());
-    (*volume->mutable_volume_context())["path"] = getVolumePath(volumeInfo);
+    volume->set_capacity_bytes(volumeInfo.capacity.bytes());
+    *volume->mutable_volume_context() = volumeInfo.context;
   }
 
   return Status::OK;
@@ -1079,11 +1091,9 @@ Status TestCSIPlugin::GetCapacity(
 }
 
 
-string TestCSIPlugin::getVolumePath(const VolumeInfo& volumeInfo)
+string TestCSIPlugin::getVolumePath(const Bytes& capacity, const string& name)
 {
-  return path::join(
-      workDir,
-      strings::join("-", stringify(volumeInfo.size), volumeInfo.id));
+  return path::join(workDir, strings::join("-", capacity, http::encode(name)));
 }
 
 
@@ -1250,31 +1260,62 @@ Status TestCSIPlugin::NodeGetInfo(
 }
 
 
-Try<TestCSIPlugin::VolumeInfo> TestCSIPlugin::parseVolumePath(
-    const string& path)
+Try<VolumeInfo> TestCSIPlugin::parseVolumePath(const string& dir)
 {
-  size_t pos = path.find_first_of("-");
-  if (pos == string::npos) {
-    return Error("Cannot find the delimiter");
+  // TODO(chhsiao): Consider using `<regex>`, which requires GCC 4.9+.
+
+  // Make sure there's a separator at the end of the prefix so that we
+  // don't accidentally slice off part of a directory.
+  const string prefix = path::join(workDir, "");
+
+  if (!strings::startsWith(dir, prefix)) {
+    return Error(
+        "Directory '" + dir + "' does not fall under work directory '" +
+        prefix + "'");
   }
 
-  string bytesString = path.substr(0, path.find_first_of("-"));
-  string id = path.substr(path.find_first_of("-") + 1);
+  const string basename = Path(dir).basename();
 
-  Try<Bytes> bytes = Bytes::parse(bytesString);
-  if (bytes.isError()) {
-    return Error("Failed to parse bytes: " + bytes.error());
+  vector<string> tokens = strings::tokenize(basename, "-", 2);
+  if (tokens.size() != 2) {
+    return Error("Cannot find delimiter '-' in '" + basename + "'");
   }
 
-  VolumeInfo volumeInfo;
-  volumeInfo.id = id;
-  volumeInfo.size = bytes.get();
+  Try<Bytes> capacity = Bytes::parse(tokens[0]);
+  if (capacity.isError()) {
+    return Error(
+        "Failed to parse capacity from '" + tokens[0] +
+        "': " + capacity.error());
+  }
 
-  return volumeInfo;
+  Try<string> name = http::decode(tokens[1]);
+  if (name.isError()) {
+    return Error(
+        "Failed to decode volume name from '" + tokens[1] +
+        "': " + name.error());
+  }
+
+  CHECK_EQ(dir, getVolumePath(capacity.get(), name.get()))
+    << "Cannot reconstruct volume path '" << dir << "' from volume name '"
+    << name.get() << "' and capacity " << capacity.get();
+
+  return VolumeInfo{capacity.get(), dir, volumeMetadata};
 }
 
 
-Try<TestCSIPlugin::VolumeInfo, StatusError> TestCSIPlugin::createVolume(
+Option<VolumeInfo> TestCSIPlugin::findVolumeByName(const string& name)
+{
+  foreachvalue (const VolumeInfo& volumeInfo, volumes) {
+    if (volumeInfo.id == getVolumePath(volumeInfo.capacity, name)) {
+      return volumeInfo;
+    }
+  }
+
+  return None();
+}
+
+
+Try<VolumeInfo, StatusError> TestCSIPlugin::createVolume(
     const string& name,
     const Bytes& requiredBytes,
     const Bytes& limitBytes,
@@ -1296,43 +1337,42 @@ Try<TestCSIPlugin::VolumeInfo, StatusError> TestCSIPlugin::createVolume(
         grpc::INVALID_ARGUMENT, "Unsupported create parameters"));
   }
 
-  if (volumes.contains(volumeId)) {
-    const VolumeInfo& volumeInfo = volumes.at(volumeId);
+  Option<VolumeInfo> found = findVolumeByName(name);
 
-    if (volumeInfo.size > limitBytes) {
+  if (found.isSome()) {
+    if (found->capacity > limitBytes) {
       return StatusError(Status(
           grpc::ALREADY_EXISTS, "Cannot satisfy limit bytes"));
     }
 
-    if (volumeInfo.size < requiredBytes) {
+    if (found->capacity < requiredBytes) {
       return StatusError(Status(
           grpc::ALREADY_EXISTS, "Cannot satisfy required bytes"));
     }
 
-    return volumeInfo;
+    return *found;
   } else {
     if (availableCapacity < requiredBytes) {
       return StatusError(Status(grpc::OUT_OF_RANGE, "Insufficient capacity"));
     }
 
-    VolumeInfo volumeInfo;
-    volumeInfo.id = volumeId;
 
     // We assume that `requiredBytes <= limitBytes` has been verified.
     const Bytes defaultSize = min(availableCapacity, DEFAULT_VOLUME_CAPACITY);
-    volumeInfo.size = min(max(defaultSize, requiredBytes), limitBytes);
 
-    const string path = getVolumePath(volumeInfo);
+    VolumeInfo volumeInfo{min(max(defaultSize, requiredBytes), limitBytes),
+                          getVolumePath(volumeInfo.capacity, name),
+                          volumeMetadata};
 
-    Try<Nothing> mkdir = os::mkdir(path);
+    Try<Nothing> mkdir = os::mkdir(volumeInfo.id);
     if (mkdir.isError()) {
       return StatusError(Status(
           grpc::INTERNAL,
           "Failed to create volume '" + volumeInfo.id + "': " + mkdir.error()));
     }
 
-    CHECK_GE(availableCapacity, volumeInfo.size);
-    availableCapacity -= volumeInfo.size;
+    CHECK_GE(availableCapacity, volumeInfo.capacity);
+    availableCapacity -= volumeInfo.capacity;
     volumes.put(volumeInfo.id, volumeInfo);
 
     return volumeInfo;
@@ -1350,16 +1390,15 @@ Try<Nothing, StatusError> TestCSIPlugin::deleteVolume(const string& volumeId)
   }
 
   const VolumeInfo& volumeInfo = volumes.at(volumeId);
-  const string path = getVolumePath(volumeInfo);
 
-  Try<Nothing> rmdir = os::rmdir(path);
+  Try<Nothing> rmdir = os::rmdir(volumeInfo.id);
   if (rmdir.isError()) {
     return StatusError(Status(
         grpc::INTERNAL,
         "Failed to delete volume '" + volumeId + "': " + rmdir.error()));
   }
 
-  availableCapacity += volumeInfo.size;
+  availableCapacity += volumeInfo.capacity;
   volumes.erase(volumeInfo.id);
 
   return Nothing();
@@ -1394,9 +1433,8 @@ Try<Nothing, StatusError> TestCSIPlugin::controllerPublishVolume(
   }
 
   const VolumeInfo& volumeInfo = volumes.at(volumeId);
-  const string path = getVolumePath(volumeInfo);
 
-  if (!volumeContext.count("path") || volumeContext.at("path") != path) {
+  if (volumeContext != volumeInfo.context) {
     return StatusError(Status(
         grpc::INVALID_ARGUMENT, "Invalid volume context"));
   }
@@ -1436,9 +1474,8 @@ Try<Option<Error>, StatusError> TestCSIPlugin::validateVolumeCapabilities(
   }
 
   const VolumeInfo& volumeInfo = volumes.at(volumeId);
-  const string path = getVolumePath(volumeInfo);
 
-  if (!volumeContext.count("path") || volumeContext.at("path") != path) {
+  if (volumeContext != volumeInfo.context) {
     return StatusError(Status(
         grpc::INVALID_ARGUMENT, "Invalid volume context"));
   }
@@ -1457,9 +1494,8 @@ Try<Option<Error>, StatusError> TestCSIPlugin::validateVolumeCapabilities(
 }
 
 
-Try<vector<TestCSIPlugin::VolumeInfo>, StatusError> TestCSIPlugin::listVolumes(
-    const Option<int32_t>& maxEntries,
-    const Option<string>& startingToken)
+Try<vector<VolumeInfo>, StatusError> TestCSIPlugin::listVolumes(
+    const Option<int32_t>& maxEntries, const Option<string>& startingToken)
 {
   // TODO(chhsiao): Support max entries.
   if (maxEntries.isSome()) {
@@ -1527,14 +1563,15 @@ Try<Nothing, StatusError> TestCSIPlugin::nodeStageVolume(
   }
 
   const VolumeInfo& volumeInfo = volumes.at(volumeId);
-  const string path = getVolumePath(volumeInfo);
 
-  if (!volumeContext.count("path") || volumeContext.at("path") != path) {
+  if (volumeContext != volumeInfo.context) {
     return StatusError(Status(
         grpc::INVALID_ARGUMENT, "Invalid volume context"));
   }
 
-  Try<fs::MountInfoTable> table = fs::MountInfoTable::read();
+  Try<internal::fs::MountInfoTable> table =
+    internal::fs::MountInfoTable::read();
+
   if (table.isError()) {
     return StatusError(Status(
         grpc::INTERNAL, "Failed to get mount table: " + table.error()));
@@ -1543,17 +1580,19 @@ Try<Nothing, StatusError> TestCSIPlugin::nodeStageVolume(
   if (std::any_of(
           table->entries.begin(),
           table->entries.end(),
-          [&](const fs::MountInfoTable::Entry& entry) {
+          [&](const internal::fs::MountInfoTable::Entry& entry) {
             return entry.target == stagingPath;
           })) {
     return Nothing();
   }
 
-  Try<Nothing> mount = fs::mount(path, stagingPath, None(), MS_BIND, None());
+  Try<Nothing> mount =
+    internal::fs::mount(volumeInfo.id, stagingPath, None(), MS_BIND, None());
+
   if (mount.isError()) {
     return StatusError(Status(
         grpc::INTERNAL,
-        "Failed to mount from '" + path + "' to '" + stagingPath +
+        "Failed to mount from '" + volumeInfo.id + "' to '" + stagingPath +
           "': " + mount.error()));
   }
 
@@ -1569,7 +1608,9 @@ Try<Nothing, StatusError> TestCSIPlugin::nodeUnstageVolume(
         grpc::NOT_FOUND, "Volume '" + volumeId + "' does not exist"));
   }
 
-  Try<fs::MountInfoTable> table = fs::MountInfoTable::read();
+  Try<internal::fs::MountInfoTable> table =
+    internal::fs::MountInfoTable::read();
+
   if (table.isError()) {
     return StatusError(Status(
         grpc::INTERNAL, "Failed to get mount table: " + table.error()));
@@ -1578,13 +1619,13 @@ Try<Nothing, StatusError> TestCSIPlugin::nodeUnstageVolume(
   if (std::none_of(
           table->entries.begin(),
           table->entries.end(),
-          [&](const fs::MountInfoTable::Entry& entry) {
+          [&](const internal::fs::MountInfoTable::Entry& entry) {
             return entry.target == stagingPath;
           })) {
     return Nothing();
   }
 
-  Try<Nothing> unmount = fs::unmount(stagingPath);
+  Try<Nothing> unmount = internal::fs::unmount(stagingPath);
   if (unmount.isError()) {
     return StatusError(Status(
         grpc::INTERNAL,
@@ -1626,14 +1667,15 @@ Try<Nothing, StatusError> TestCSIPlugin::nodePublishVolume(
   }
 
   const VolumeInfo& volumeInfo = volumes.at(volumeId);
-  const string path = getVolumePath(volumeInfo);
 
-  if (!volumeContext.count("path") || volumeContext.at("path") != path) {
+  if (volumeContext != volumeInfo.context) {
     return StatusError(Status(
         grpc::INVALID_ARGUMENT, "Invalid volume context"));
   }
 
-  Try<fs::MountInfoTable> table = fs::MountInfoTable::read();
+  Try<internal::fs::MountInfoTable> table =
+    internal::fs::MountInfoTable::read();
+
   if (table.isError()) {
     return StatusError(Status(
         grpc::INTERNAL, "Failed to get mount table: " + table.error()));
@@ -1642,7 +1684,7 @@ Try<Nothing, StatusError> TestCSIPlugin::nodePublishVolume(
   if (std::none_of(
           table->entries.begin(),
           table->entries.end(),
-          [&](const fs::MountInfoTable::Entry& entry) {
+          [&](const internal::fs::MountInfoTable::Entry& entry) {
             return entry.target == stagingPath;
           })) {
     return StatusError(Status(
@@ -1653,13 +1695,13 @@ Try<Nothing, StatusError> TestCSIPlugin::nodePublishVolume(
   if (std::any_of(
           table->entries.begin(),
           table->entries.end(),
-          [&](const fs::MountInfoTable::Entry& entry) {
+          [&](const internal::fs::MountInfoTable::Entry& entry) {
             return entry.target == targetPath;
           })) {
     return Nothing();
   }
 
-  Try<Nothing> mount = fs::mount(
+  Try<Nothing> mount = internal::fs::mount(
       stagingPath,
       targetPath,
       None(),
@@ -1685,7 +1727,9 @@ Try<Nothing, StatusError> TestCSIPlugin::nodeUnpublishVolume(
         grpc::NOT_FOUND, "Volume '" + volumeId + "' does not exist"));
   }
 
-  Try<fs::MountInfoTable> table = fs::MountInfoTable::read();
+  Try<internal::fs::MountInfoTable> table =
+    internal::fs::MountInfoTable::read();
+
   if (table.isError()) {
     return StatusError(Status(
         grpc::INTERNAL, "Failed to get mount table: " + table.error()));
@@ -1694,13 +1738,13 @@ Try<Nothing, StatusError> TestCSIPlugin::nodeUnpublishVolume(
   if (std::none_of(
           table->entries.begin(),
           table->entries.end(),
-          [&](const fs::MountInfoTable::Entry& entry) {
+          [&](const internal::fs::MountInfoTable::Entry& entry) {
             return entry.target == targetPath;
           })) {
     return Nothing();
   }
 
-  Try<Nothing> unmount = fs::unmount(targetPath);
+  Try<Nothing> unmount = internal::fs::unmount(targetPath);
   if (unmount.isError()) {
     return StatusError(Status(
         grpc::INTERNAL,
@@ -1716,8 +1760,12 @@ Try<Nothing, StatusError> TestCSIPlugin::nodeUnpublishVolume(
 class CSIProxy
 {
 public:
-  CSIProxy(const string& _endpoint, const string& forward)
-    : endpoint(_endpoint),
+  CSIProxy(
+      const Option<string>& _apiVersion,
+      const string& _endpoint,
+      const string& forward)
+    : apiVersion(_apiVersion),
+      endpoint(_endpoint),
       stub(grpc::CreateChannel(forward, grpc::InsecureChannelCredentials())),
       service(new AsyncGenericService()) {}
 
@@ -1747,6 +1795,7 @@ private:
 
   void serve(ServerCompletionQueue* completionQueue);
 
+  const Option<string> apiVersion;
   const string endpoint;
 
   GenericStub stub;
@@ -1779,13 +1828,13 @@ void CSIProxy::run()
 // The lifecycle of a forwarded CSI call is shown as follows. The transitions
 // happen after the completions of the API calls.
 //
-//                                                     Server-side
-//        +-------------+             +-------------+ WriteAndFinish +---+
-//        | INITIALIZED |             |  FINISHING  +----------------> X |
-//        +------+------+             +------^------+                +---+
-//   Server-side |                           | Client-side
-//   RequestCall |        Server-side        | Finish (unary call)
-//        +------v------+    Read     +------+------+
+//                        Unsupported                  Server-side
+//        +-------------+ API version +-------------+ WriteAndFinish +---+
+//        | INITIALIZED |   +--------->  FINISHING  +----------------> X |
+//        +------+------+   |         +------^------+                +---+
+//   Server-side |   +------+                | Client-side
+//   RequestCall |   |    Server-side        | Finish (unary call)
+//        +------v---+--+    Read     +------+------+
 //        |  REQUESTED  +-------------> FORWARDING  |
 //        +-------------+             +-------------+
 //
@@ -1816,7 +1865,7 @@ void CSIProxy::serve(ServerCompletionQueue* completionQueue)
         if (!ok) {
           // Server-side `RequestCall`: the server has been shutdown so continue
           // to drain the queue.
-          continue;
+          break;
         }
 
         call->state = Call::State::REQUESTED;
@@ -1841,13 +1890,29 @@ void CSIProxy::serve(ServerCompletionQueue* completionQueue)
       case Call::State::REQUESTED: {
         if (!ok) {
           // Server-side `Read`: the client has done a `WritesDone` already, so
-          // clean up the call and move on to the next one.
+          // clean up the call and move to the next iteration immediately.
           delete call;
           continue;
         }
 
-        LOG(INFO) << "Forwarding " << call->serverContext.method() << " call";
+        // The expected method names are of the following form:
+        //   /csi.<api_version>.<service_name>/<rpc_name>
+        // See: https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#requests // NOLINT
+        if (apiVersion.isSome() &&
+            !strings::startsWith(
+                call->serverContext.method(),
+                "/csi." + apiVersion.get() + ".")) {
+          // The proxy does not support the API version of the call so respond
+          // with `UNIMPLEMENTED`.
+          call->state = Call::State::FINISHING;
+          call->status = Status(grpc::UNIMPLEMENTED, "");
+          call->serverReaderWriter.WriteAndFinish(
+              call->response, WriteOptions(), call->status, call);
 
+          break;
+        }
+
+        LOG(INFO) << "Forwarding " << call->serverContext.method() << " call";
         call->state = Call::State::FORWARDING;
 
         call->clientContext.set_wait_for_ready(true);
@@ -1895,10 +1960,10 @@ void CSIProxy::serve(ServerCompletionQueue* completionQueue)
                      << call->serverContext.method() << " call";
         }
 
-        // The call is completed so clean it up.
+        // The call is completed so clean it up and move to the next iteration
+        // immediately.
         delete call;
-
-        break;
+        continue;
       }
     }
   }
@@ -1940,19 +2005,27 @@ int main(int argc, char** argv)
     foreachpair (const string& param,
                  const vector<string>& values,
                  strings::pairs(flags.create_parameters.get(), ";", "=")) {
-      Option<Error> error;
-
       if (values.size() != 1) {
-        error = "Parameter keys must be unique";
-      } else {
-        createParameters.put(param, values[0]);
-      }
-
-      if (error.isSome()) {
-        cerr << "Failed to parse the '--create_parameters' flags: "
-             << error->message << endl;
+        cerr << "Parameter key '" << param << "' is not unique" << endl;
         return EXIT_FAILURE;
       }
+
+      createParameters.put(param, values[0]);
+    }
+  }
+
+  hashmap<string, string> volumeMetadata;
+
+  if (flags.volume_metadata.isSome()) {
+    foreachpair (const string& prop,
+                 const vector<string>& values,
+                 strings::pairs(flags.volume_metadata.get(), ";", "=")) {
+      if (values.size() != 1) {
+        cerr << "Metadata key '" << prop << "' is not unique" << endl;
+        return EXIT_FAILURE;
+      }
+
+      volumeMetadata.put(prop, values[0]);
     }
   }
 
@@ -1964,13 +2037,8 @@ int main(int argc, char** argv)
                  strings::pairs(flags.volumes.get(), ";", ":")) {
       Option<Error> error;
 
-      if (strings::contains(name, stringify(os::PATH_SEPARATOR))) {
-        error =
-          "Volume name cannot contain '" + stringify(os::PATH_SEPARATOR) + "'";
-      } else if (capacities.size() != 1) {
+      if (capacities.size() != 1) {
         error = "Volume name must be unique";
-      } else if (volumes.contains(name)) {
-        error = "Volume '" + name + "' already exists";
       } else {
         Try<Bytes> capacity = Bytes::parse(capacities[0]);
         if (capacity.isError()) {
@@ -2000,7 +2068,7 @@ int main(int argc, char** argv)
   }
 
   if (flags.forward.isSome()) {
-    CSIProxy proxy(flags.endpoint, flags.forward.get());
+    CSIProxy proxy(flags.api_version, flags.endpoint, flags.forward.get());
 
     proxy.run();
   } else {
@@ -2010,6 +2078,7 @@ int main(int argc, char** argv)
         flags.work_dir,
         flags.available_capacity,
         createParameters,
+        volumeMetadata,
         volumes);
 
     plugin.run();
